@@ -1,0 +1,1078 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.IO;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace ExternalMonitorDimmer
+{
+    internal sealed class MainForm : Form
+    {
+        private static readonly Color WindowBackground = Color.FromArgb(247, 248, 246);
+        private static readonly Color Surface = Color.White;
+        private static readonly Color TextPrimary = Color.FromArgb(31, 37, 34);
+        private static readonly Color TextSecondary = Color.FromArgb(91, 99, 94);
+        private static readonly Color Border = Color.FromArgb(216, 221, 218);
+        private static readonly Color Accent = Color.FromArgb(24, 121, 78);
+        private static readonly Color AccentHover = Color.FromArgb(18, 101, 64);
+        private static readonly Color Warning = Color.FromArgb(178, 106, 0);
+        private static readonly Color Error = Color.FromArgb(184, 49, 47);
+        private static readonly Color Inactive = Color.FromArgb(132, 140, 135);
+
+        private readonly bool startHidden;
+        private readonly AppSettings settings;
+        private readonly System.Windows.Forms.Timer monitorTimer;
+
+        private NumericUpDown idleValue;
+        private ComboBox idleUnit;
+        private TrackBar brightnessSlider;
+        private NumericUpDown brightnessValue;
+        private CheckBox autoStartCheck;
+        private CheckBox screenSaverCheck;
+        private Label statusLabel;
+        private Panel statusDot;
+        private Label idleStatusLabel;
+        private Label monitorCountLabel;
+        private ListView monitorList;
+        private Button applyButton;
+        private Button stopButton;
+        private NotifyIcon trayIcon;
+        private ToolStripMenuItem trayToggleItem;
+        private Icon applicationIcon;
+
+        private bool monitoring;
+        private bool dimmed;
+        private bool busy;
+        private bool allowExit;
+        private bool trayHintShown;
+        private bool syncingBrightnessControls;
+        private bool syncingIdleUnit;
+        private int lastIdleUnitIndex;
+        private DateTime nextDimAttemptUtc = DateTime.MinValue;
+        private DateTime nextRestoreAttemptUtc = DateTime.MinValue;
+        private DateTime nextStatusUpdateUtc = DateTime.MinValue;
+
+        public MainForm(bool startHidden)
+        {
+            this.startHidden = startHidden;
+            settings = SettingsStore.LoadSettings();
+            settings.AutoStart = StartupManager.IsEnabled();
+
+            Text = "外接显示器休眠调光";
+            BackColor = WindowBackground;
+            ForeColor = TextPrimary;
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            StartPosition = FormStartPosition.CenterScreen;
+            ClientSize = new Size(720, 594);
+            MinimumSize = new Size(660, 548);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            KeyPreview = true;
+
+            applicationIcon = CreateApplicationIcon();
+            Icon = applicationIcon;
+
+            BuildInterface();
+            BuildTrayIcon();
+            LoadSettingsIntoControls();
+
+            monitorTimer = new System.Windows.Forms.Timer();
+            monitorTimer.Interval = 200;
+            monitorTimer.Tick += MonitorTimerTick;
+
+            Shown += FormShown;
+            FormClosing += FormClosingHandler;
+            FormClosed += FormClosedHandler;
+            Resize += FormResizeHandler;
+        }
+
+        public void ShowFromTray()
+        {
+            Show();
+            ShowInTaskbar = true;
+            WindowState = FormWindowState.Normal;
+            Activate();
+            BringToFront();
+        }
+
+        private void BuildInterface()
+        {
+            TableLayoutPanel root = new TableLayoutPanel();
+            root.Dock = DockStyle.Fill;
+            root.BackColor = WindowBackground;
+            root.ColumnCount = 1;
+            root.RowCount = 6;
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 1F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 188F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 1F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76F));
+            Controls.Add(root);
+
+            root.Controls.Add(BuildHeader(), 0, 0);
+            root.Controls.Add(CreateSeparator(), 0, 1);
+            root.Controls.Add(BuildSettingsPanel(), 0, 2);
+            root.Controls.Add(CreateSeparator(), 0, 3);
+            root.Controls.Add(BuildMonitorPanel(), 0, 4);
+            root.Controls.Add(BuildFooter(), 0, 5);
+        }
+
+        private Control BuildHeader()
+        {
+            Panel panel = new Panel();
+            panel.Dock = DockStyle.Fill;
+            panel.BackColor = Surface;
+
+            Label title = new Label();
+            title.AutoSize = true;
+            title.Location = new Point(24, 14);
+            title.Font = new Font(Font.FontFamily, 15F, FontStyle.Bold, GraphicsUnit.Point);
+            title.ForeColor = TextPrimary;
+            title.Text = "外接显示器休眠调光";
+            panel.Controls.Add(title);
+
+            Label subtitle = new Label();
+            subtitle.AutoSize = true;
+            subtitle.Location = new Point(26, 52);
+            subtitle.ForeColor = TextSecondary;
+            subtitle.Text = "DDC/CI 显示器";
+            panel.Controls.Add(subtitle);
+
+            statusLabel = new Label();
+            statusLabel.AutoEllipsis = true;
+            statusLabel.Size = new Size(220, 24);
+            statusLabel.Location = new Point(panel.Width - 246, 31);
+            statusLabel.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+            statusLabel.ForeColor = TextSecondary;
+            statusLabel.Text = "未启动";
+            panel.Controls.Add(statusLabel);
+
+            statusDot = new Panel();
+            statusDot.Size = new Size(14, 14);
+            statusDot.Location = new Point(panel.Width - 268, 36);
+            statusDot.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            statusDot.Tag = Inactive;
+            statusDot.Paint += StatusDotPaint;
+            panel.Controls.Add(statusDot);
+
+            return panel;
+        }
+
+        private Control BuildSettingsPanel()
+        {
+            Panel panel = new Panel();
+            panel.Dock = DockStyle.Fill;
+            panel.BackColor = WindowBackground;
+
+            Label heading = new Label();
+            heading.AutoSize = true;
+            heading.Location = new Point(24, 14);
+            heading.Font = new Font(Font.FontFamily, 11F, FontStyle.Bold, GraphicsUnit.Point);
+            heading.Text = "自动调光";
+            panel.Controls.Add(heading);
+
+            Label idleLabel = new Label();
+            idleLabel.AutoSize = true;
+            idleLabel.Location = new Point(24, 48);
+            idleLabel.ForeColor = TextSecondary;
+            idleLabel.Text = "未操作时长";
+            panel.Controls.Add(idleLabel);
+
+            idleValue = new NumericUpDown();
+            idleValue.Location = new Point(24, 72);
+            idleValue.Size = new Size(116, 28);
+            idleValue.Minimum = 1;
+            idleValue.Maximum = 86400;
+            idleValue.TextAlign = HorizontalAlignment.Right;
+            idleValue.Font = new Font(Font.FontFamily, 10F, FontStyle.Regular, GraphicsUnit.Point);
+            idleValue.AccessibleName = "未操作时长";
+            panel.Controls.Add(idleValue);
+
+            idleUnit = new ComboBox();
+            idleUnit.DropDownStyle = ComboBoxStyle.DropDownList;
+            idleUnit.FlatStyle = FlatStyle.Flat;
+            idleUnit.Items.Add("秒");
+            idleUnit.Items.Add("分钟");
+            idleUnit.Location = new Point(148, 71);
+            idleUnit.Size = new Size(82, 30);
+            idleUnit.AccessibleName = "时间单位";
+            idleUnit.SelectedIndexChanged += IdleUnitChanged;
+            panel.Controls.Add(idleUnit);
+
+            Label brightnessLabel = new Label();
+            brightnessLabel.AutoSize = true;
+            brightnessLabel.Location = new Point(270, 48);
+            brightnessLabel.ForeColor = TextSecondary;
+            brightnessLabel.Text = "最低亮度";
+            panel.Controls.Add(brightnessLabel);
+
+            brightnessSlider = new TrackBar();
+            brightnessSlider.Location = new Point(264, 69);
+            brightnessSlider.Size = new Size(276, 40);
+            brightnessSlider.Minimum = 0;
+            brightnessSlider.Maximum = 100;
+            brightnessSlider.TickFrequency = 10;
+            brightnessSlider.SmallChange = 1;
+            brightnessSlider.LargeChange = 10;
+            brightnessSlider.ValueChanged += BrightnessSliderChanged;
+            panel.Controls.Add(brightnessSlider);
+
+            brightnessValue = new NumericUpDown();
+            brightnessValue.Location = new Point(550, 72);
+            brightnessValue.Size = new Size(76, 28);
+            brightnessValue.Minimum = 0;
+            brightnessValue.Maximum = 100;
+            brightnessValue.TextAlign = HorizontalAlignment.Right;
+            brightnessValue.Font = new Font(Font.FontFamily, 10F, FontStyle.Regular, GraphicsUnit.Point);
+            brightnessValue.AccessibleName = "最低亮度数值";
+            brightnessValue.ValueChanged += BrightnessValueChanged;
+            panel.Controls.Add(brightnessValue);
+
+            Label percentLabel = new Label();
+            percentLabel.AutoSize = true;
+            percentLabel.Location = new Point(633, 77);
+            percentLabel.Text = "%";
+            panel.Controls.Add(percentLabel);
+
+            autoStartCheck = new CheckBox();
+            autoStartCheck.AutoSize = true;
+            autoStartCheck.FlatStyle = FlatStyle.Flat;
+            autoStartCheck.Location = new Point(24, 132);
+            autoStartCheck.Text = "登录 Windows 后自动运行";
+            panel.Controls.Add(autoStartCheck);
+
+            screenSaverCheck = new CheckBox();
+            screenSaverCheck.AutoSize = true;
+            screenSaverCheck.FlatStyle = FlatStyle.Flat;
+            screenSaverCheck.Location = new Point(340, 132);
+            screenSaverCheck.Text = "同步使用黑屏屏保";
+            panel.Controls.Add(screenSaverCheck);
+
+            return panel;
+        }
+
+        private Control BuildMonitorPanel()
+        {
+            Panel panel = new Panel();
+            panel.Dock = DockStyle.Fill;
+            panel.BackColor = WindowBackground;
+
+            Label heading = new Label();
+            heading.AutoSize = true;
+            heading.Location = new Point(24, 16);
+            heading.Font = new Font(Font.FontFamily, 11F, FontStyle.Bold, GraphicsUnit.Point);
+            heading.Text = "显示器";
+            panel.Controls.Add(heading);
+
+            monitorCountLabel = new Label();
+            monitorCountLabel.AutoSize = true;
+            monitorCountLabel.Location = new Point(88, 19);
+            monitorCountLabel.ForeColor = TextSecondary;
+            monitorCountLabel.Text = "正在检测";
+            panel.Controls.Add(monitorCountLabel);
+
+            Button refreshButton = CreateSecondaryButton("重新检测", 92);
+            refreshButton.Location = new Point(panel.Width - 116, 10);
+            refreshButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            refreshButton.Click += delegate { RefreshMonitorList(); };
+            panel.Controls.Add(refreshButton);
+
+            monitorList = new ListView();
+            monitorList.Location = new Point(24, 48);
+            monitorList.Size = new Size(panel.Width - 48, panel.Height - 64);
+            monitorList.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+            monitorList.View = View.Details;
+            monitorList.FullRowSelect = true;
+            monitorList.GridLines = true;
+            monitorList.HeaderStyle = ColumnHeaderStyle.Nonclickable;
+            monitorList.HideSelection = false;
+            monitorList.BackColor = Surface;
+            monitorList.BorderStyle = BorderStyle.FixedSingle;
+            monitorList.Columns.Add("显示输出", 128);
+            monitorList.Columns.Add("显示器", 280);
+            monitorList.Columns.Add("当前亮度", 110);
+            monitorList.Columns.Add("范围", 100);
+            monitorList.Resize += delegate { ResizeMonitorColumns(); };
+            panel.Controls.Add(monitorList);
+
+            return panel;
+        }
+
+        private Control BuildFooter()
+        {
+            Panel panel = new Panel();
+            panel.Dock = DockStyle.Fill;
+            panel.BackColor = Surface;
+
+            idleStatusLabel = new Label();
+            idleStatusLabel.AutoEllipsis = true;
+            idleStatusLabel.Location = new Point(24, 29);
+            idleStatusLabel.Size = new Size(210, 22);
+            idleStatusLabel.ForeColor = TextSecondary;
+            idleStatusLabel.Text = "空闲 0.0 秒";
+            panel.Controls.Add(idleStatusLabel);
+
+            applyButton = CreatePrimaryButton("应用并开始", 126);
+            applyButton.Location = new Point(panel.Width - 476, 18);
+            applyButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            applyButton.Click += delegate { ApplySettingsAndStart(); };
+            panel.Controls.Add(applyButton);
+
+            stopButton = CreateSecondaryButton("停止监控", 104);
+            stopButton.Location = new Point(panel.Width - 340, 18);
+            stopButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            stopButton.Click += delegate { StopMonitoring(true); };
+            panel.Controls.Add(stopButton);
+
+            Button hideButton = CreateSecondaryButton("隐藏到托盘", 112);
+            hideButton.Location = new Point(panel.Width - 226, 18);
+            hideButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            hideButton.Click += delegate { HideToTray(); };
+            panel.Controls.Add(hideButton);
+
+            Button exitButton = CreateSecondaryButton("退出程序", 96);
+            exitButton.Location = new Point(panel.Width - 104, 18);
+            exitButton.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            exitButton.Click += delegate { ExitApplication(); };
+            panel.Controls.Add(exitButton);
+
+            return panel;
+        }
+
+        private Control CreateSeparator()
+        {
+            Panel separator = new Panel();
+            separator.Dock = DockStyle.Fill;
+            separator.BackColor = Border;
+            return separator;
+        }
+
+        private Button CreatePrimaryButton(string text, int width)
+        {
+            Button button = new Button();
+            button.Size = new Size(width, 40);
+            button.Text = text;
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderSize = 0;
+            button.BackColor = Accent;
+            button.ForeColor = Color.White;
+            button.Cursor = Cursors.Hand;
+            button.Font = new Font(Font.FontFamily, 9F, FontStyle.Bold, GraphicsUnit.Point);
+            button.MouseEnter += delegate { button.BackColor = AccentHover; };
+            button.MouseLeave += delegate { button.BackColor = Accent; };
+            return button;
+        }
+
+        private Button CreateSecondaryButton(string text, int width)
+        {
+            Button button = new Button();
+            button.Size = new Size(width, 40);
+            button.Text = text;
+            button.FlatStyle = FlatStyle.Flat;
+            button.FlatAppearance.BorderColor = Border;
+            button.FlatAppearance.BorderSize = 1;
+            button.BackColor = Surface;
+            button.ForeColor = TextPrimary;
+            button.Cursor = Cursors.Hand;
+            return button;
+        }
+
+        private void BuildTrayIcon()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Font = Font;
+
+            ToolStripMenuItem showItem = new ToolStripMenuItem("显示窗口");
+            showItem.Click += delegate { ShowFromTray(); };
+            menu.Items.Add(showItem);
+
+            trayToggleItem = new ToolStripMenuItem("开始监控");
+            trayToggleItem.Click += delegate
+            {
+                if (monitoring)
+                {
+                    StopMonitoring(true);
+                }
+                else
+                {
+                    ApplySettingsAndStart();
+                }
+            };
+            menu.Items.Add(trayToggleItem);
+            menu.Items.Add(new ToolStripSeparator());
+
+            ToolStripMenuItem exitItem = new ToolStripMenuItem("退出程序");
+            exitItem.Click += delegate { ExitApplication(); };
+            menu.Items.Add(exitItem);
+
+            trayIcon = new NotifyIcon();
+            trayIcon.Icon = applicationIcon;
+            trayIcon.Text = "外接显示器休眠调光";
+            trayIcon.ContextMenuStrip = menu;
+            trayIcon.Visible = true;
+            trayIcon.DoubleClick += delegate { ShowFromTray(); };
+        }
+
+        private void LoadSettingsIntoControls()
+        {
+            syncingIdleUnit = true;
+            bool useMinutes = settings.DisplayMinutes && settings.IdleSeconds >= 60;
+            idleUnit.SelectedIndex = useMinutes ? 1 : 0;
+            lastIdleUnitIndex = idleUnit.SelectedIndex;
+            idleValue.Maximum = useMinutes ? 1440 : 86400;
+            decimal displayedValue = useMinutes
+                ? Math.Max(1, (decimal)Math.Round(settings.IdleSeconds / 60.0))
+                : Math.Max(1, settings.IdleSeconds);
+            idleValue.Value = Math.Min(idleValue.Maximum, displayedValue);
+            syncingIdleUnit = false;
+
+            syncingBrightnessControls = true;
+            int brightness = Math.Max(0, Math.Min(100, settings.DimPercent));
+            brightnessSlider.Value = brightness;
+            brightnessValue.Value = brightness;
+            syncingBrightnessControls = false;
+
+            autoStartCheck.Checked = settings.AutoStart;
+            screenSaverCheck.Checked = settings.SyncBlankScreenSaver;
+        }
+
+        private void FormShown(object sender, EventArgs e)
+        {
+            SettingsStore.Log(String.Format(
+                "Main window shown. StartHidden={0}, Visible={1}, WindowState={2}, ShowInTaskbar={3}.",
+                startHidden,
+                Visible,
+                WindowState,
+                ShowInTaskbar));
+            RecoverSavedBrightness();
+            RefreshMonitorList();
+            monitorTimer.Start();
+
+            if (settings.MonitoringEnabled)
+            {
+                try
+                {
+                    ApplyScreenSaverMode();
+                    monitoring = true;
+                    SetStatus("监控中", Accent);
+                    UpdateMonitoringControls();
+                }
+                catch (Exception ex)
+                {
+                    monitoring = false;
+                    settings.MonitoringEnabled = false;
+                    SettingsStore.SaveSettings(settings);
+                    SetStatus("未启动", Error);
+                    UpdateMonitoringControls();
+                    SettingsStore.Log("Could not restore monitoring state: " + ex.Message);
+
+                    if (!startHidden)
+                    {
+                        MessageBox.Show(
+                            this,
+                            ex.Message,
+                            "无法恢复监控",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                    }
+                }
+            }
+            else
+            {
+                SetStatus("未启动", Inactive);
+                UpdateMonitoringControls();
+            }
+
+            if (startHidden)
+            {
+                BeginInvoke(new Action(HideToTray));
+            }
+
+            SettingsStore.Log(String.Format(
+                "Initial window state completed. Visible={0}, WindowState={1}, ShowInTaskbar={2}.",
+                Visible,
+                WindowState,
+                ShowInTaskbar));
+        }
+
+        private void ApplySettingsAndStart()
+        {
+            try
+            {
+                ReadSettingsFromControls();
+                StartupManager.SetEnabled(settings.AutoStart);
+                ApplyScreenSaverMode();
+
+                if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
+                {
+                    RestoreSavedBrightness();
+                }
+
+                settings.MonitoringEnabled = true;
+                SettingsStore.SaveSettings(settings);
+                monitoring = true;
+                nextDimAttemptUtc = DateTime.MinValue;
+                SetStatus("监控中", Accent);
+                UpdateMonitoringControls();
+                SettingsStore.Log(String.Format(
+                    "Monitoring started. Idle={0}s, Dim={1}%.",
+                    settings.IdleSeconds,
+                    settings.DimPercent));
+            }
+            catch (Exception ex)
+            {
+                SetStatus("设置未应用", Error);
+                MessageBox.Show(
+                    this,
+                    ex.Message,
+                    "无法应用设置",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        private void StopMonitoring(bool persist)
+        {
+            monitoring = false;
+            RestoreSavedBrightness();
+            TryRestoreScreenSaver(true);
+
+            if (persist)
+            {
+                settings.MonitoringEnabled = false;
+                SettingsStore.SaveSettings(settings);
+            }
+
+            SetStatus("已停止", Inactive);
+            UpdateMonitoringControls();
+            SettingsStore.Log("Monitoring stopped.");
+        }
+
+        private void ApplyScreenSaverMode()
+        {
+            if (settings.SyncBlankScreenSaver)
+            {
+                ScreenSaverManager.EnableBlank(settings.IdleSeconds);
+            }
+            else
+            {
+                ScreenSaverManager.RestoreOriginal();
+            }
+        }
+
+        private bool TryRestoreScreenSaver(bool showError)
+        {
+            try
+            {
+                ScreenSaverManager.RestoreOriginal();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                SettingsStore.Log("Could not restore screen saver settings: " + ex.Message);
+                if (showError)
+                {
+                    MessageBox.Show(
+                        this,
+                        ex.Message,
+                        "无法恢复屏保设置",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+
+                return false;
+            }
+        }
+
+        private void MonitorTimerTick(object sender, EventArgs e)
+        {
+            if (busy)
+            {
+                return;
+            }
+
+            uint idleMilliseconds;
+            try
+            {
+                idleMilliseconds = NativeMethods.GetIdleMilliseconds();
+            }
+            catch (Exception ex)
+            {
+                SetStatus("输入检测失败", Error);
+                SettingsStore.Log("Input detection failed: " + ex.Message);
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (now >= nextStatusUpdateUtc)
+            {
+                idleStatusLabel.Text = String.Format("空闲 {0:0.0} 秒", idleMilliseconds / 1000.0);
+                nextStatusUpdateUtc = now.AddMilliseconds(500);
+            }
+
+            if (!monitoring)
+            {
+                return;
+            }
+
+            ulong threshold = (ulong)settings.IdleSeconds * 1000UL;
+            if ((ulong)idleMilliseconds >= threshold)
+            {
+                if (!dimmed && now >= nextDimAttemptUtc)
+                {
+                    busy = true;
+                    try
+                    {
+                        if (!DimMonitors())
+                        {
+                            nextDimAttemptUtc = now.AddSeconds(2);
+                        }
+                    }
+                    finally
+                    {
+                        busy = false;
+                    }
+                }
+            }
+            else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
+            {
+                if (now >= nextRestoreAttemptUtc)
+                {
+                    busy = true;
+                    try
+                    {
+                        RestoreSavedBrightness();
+                        nextRestoreAttemptUtc = now.AddSeconds(2);
+                    }
+                    finally
+                    {
+                        busy = false;
+                    }
+                }
+            }
+            else
+            {
+                SetStatus("监控中", Accent);
+            }
+        }
+
+        private bool DimMonitors()
+        {
+            List<MonitorInfo> monitors = NativeMethods.GetBrightnessMonitors();
+            if (monitors.Count == 0)
+            {
+                SetStatus("未检测到 DDC/CI 显示器", Warning);
+                return false;
+            }
+
+            BrightnessState state = new BrightnessState();
+            state.SavedAt = DateTime.Now;
+            foreach (MonitorInfo monitor in monitors)
+            {
+                state.Monitors.Add(BrightnessSnapshot.FromMonitor(monitor));
+            }
+            SettingsStore.SaveBrightnessState(state);
+
+            int changedCount = 0;
+            foreach (MonitorInfo monitor in monitors)
+            {
+                double range = monitor.Maximum - monitor.Minimum;
+                uint target = (uint)Math.Round(
+                    monitor.Minimum + (range * settings.DimPercent / 100.0),
+                    MidpointRounding.AwayFromZero);
+
+                if (NativeMethods.SetBrightness(monitor.DeviceName, monitor.PhysicalIndex, target))
+                {
+                    changedCount++;
+                    SettingsStore.Log(String.Format(
+                        "Dimmed {0} from {1} to {2}.",
+                        monitor.Description,
+                        monitor.Current,
+                        target));
+                }
+            }
+
+            if (changedCount == 0)
+            {
+                SettingsStore.DeleteBrightnessState();
+                SetStatus("亮度写入失败", Error);
+                return false;
+            }
+
+            dimmed = true;
+            SetStatus("屏幕已调暗", Warning);
+            return true;
+        }
+
+        private bool RestoreSavedBrightness()
+        {
+            BrightnessState state = SettingsStore.LoadBrightnessState();
+            if (state == null || state.Monitors.Count == 0)
+            {
+                dimmed = false;
+                return true;
+            }
+
+            List<MonitorInfo> currentMonitors;
+            try
+            {
+                currentMonitors = NativeMethods.GetBrightnessMonitors();
+            }
+            catch (Exception ex)
+            {
+                SettingsStore.Log("Could not enumerate monitors for restore: " + ex.Message);
+                dimmed = true;
+                return false;
+            }
+
+            List<BrightnessSnapshot> remaining = new List<BrightnessSnapshot>();
+            foreach (BrightnessSnapshot snapshot in state.Monitors)
+            {
+                MonitorInfo current = FindCurrentMonitor(snapshot, currentMonitors);
+                bool restored = false;
+
+                if (current != null)
+                {
+                    for (int attempt = 0; attempt < 3 && !restored; attempt++)
+                    {
+                        restored = NativeMethods.SetBrightness(
+                            current.DeviceName,
+                            current.PhysicalIndex,
+                            snapshot.Brightness);
+                        if (!restored)
+                        {
+                            Thread.Sleep(150);
+                        }
+                    }
+                }
+
+                if (restored)
+                {
+                    SettingsStore.Log(String.Format(
+                        "Restored {0} to {1}.",
+                        snapshot.Description,
+                        snapshot.Brightness));
+                }
+                else
+                {
+                    remaining.Add(snapshot);
+                }
+            }
+
+            if (remaining.Count == 0)
+            {
+                SettingsStore.DeleteBrightnessState();
+                dimmed = false;
+                if (monitoring)
+                {
+                    SetStatus("监控中", Accent);
+                }
+                return true;
+            }
+
+            state.Monitors = remaining;
+            SettingsStore.SaveBrightnessState(state);
+            dimmed = true;
+            SetStatus("等待显示器重新连接", Warning);
+            return false;
+        }
+
+        private void RecoverSavedBrightness()
+        {
+            if (!File.Exists(AppPaths.BrightnessStateFile))
+            {
+                return;
+            }
+
+            SetStatus("正在恢复亮度", Warning);
+            RestoreSavedBrightness();
+        }
+
+        private MonitorInfo FindCurrentMonitor(
+            BrightnessSnapshot saved,
+            List<MonitorInfo> currentMonitors)
+        {
+            MonitorInfo match = FindUnique(currentMonitors, delegate(MonitorInfo monitor)
+            {
+                return !String.IsNullOrEmpty(saved.DeviceKey) &&
+                    monitor.DeviceKey == saved.DeviceKey &&
+                    monitor.PhysicalIndex == saved.PhysicalIndex;
+            });
+            if (match != null)
+            {
+                return match;
+            }
+
+            match = FindUnique(currentMonitors, delegate(MonitorInfo monitor)
+            {
+                return !String.IsNullOrEmpty(saved.DeviceId) &&
+                    monitor.DeviceId == saved.DeviceId &&
+                    monitor.PhysicalIndex == saved.PhysicalIndex;
+            });
+            if (match != null)
+            {
+                return match;
+            }
+
+            match = FindUnique(currentMonitors, delegate(MonitorInfo monitor)
+            {
+                return monitor.DeviceName == saved.DeviceName &&
+                    monitor.PhysicalIndex == saved.PhysicalIndex;
+            });
+            if (match != null)
+            {
+                return match;
+            }
+
+            return FindUnique(currentMonitors, delegate(MonitorInfo monitor)
+            {
+                return monitor.Description == saved.Description &&
+                    monitor.PhysicalIndex == saved.PhysicalIndex;
+            });
+        }
+
+        private MonitorInfo FindUnique(
+            List<MonitorInfo> monitors,
+            Predicate<MonitorInfo> predicate)
+        {
+            MonitorInfo found = null;
+            foreach (MonitorInfo monitor in monitors)
+            {
+                if (!predicate(monitor))
+                {
+                    continue;
+                }
+
+                if (found != null)
+                {
+                    return null;
+                }
+                found = monitor;
+            }
+            return found;
+        }
+
+        private void RefreshMonitorList()
+        {
+            try
+            {
+                List<MonitorInfo> monitors = NativeMethods.GetBrightnessMonitors();
+                monitorList.BeginUpdate();
+                monitorList.Items.Clear();
+
+                foreach (MonitorInfo monitor in monitors)
+                {
+                    double range = monitor.Maximum - monitor.Minimum;
+                    double percent = range <= 0
+                        ? 0
+                        : ((monitor.Current - monitor.Minimum) / range) * 100.0;
+
+                    ListViewItem row = new ListViewItem(monitor.DeviceName);
+                    row.SubItems.Add(String.IsNullOrWhiteSpace(monitor.Description)
+                        ? "外接显示器"
+                        : monitor.Description);
+                    row.SubItems.Add(String.Format("{0:0}%", percent));
+                    row.SubItems.Add(String.Format("{0}-{1}", monitor.Minimum, monitor.Maximum));
+                    monitorList.Items.Add(row);
+                }
+
+                monitorList.EndUpdate();
+                monitorCountLabel.Text = monitors.Count == 0
+                    ? "未检测到支持 DDC/CI 的显示器"
+                    : String.Format("{0} 台可控制", monitors.Count);
+                ResizeMonitorColumns();
+            }
+            catch (Exception ex)
+            {
+                monitorCountLabel.Text = "检测失败";
+                SettingsStore.Log("Monitor refresh failed: " + ex.Message);
+            }
+        }
+
+        private void ReadSettingsFromControls()
+        {
+            int multiplier = idleUnit.SelectedIndex == 1 ? 60 : 1;
+            long seconds = Decimal.ToInt64(idleValue.Value) * multiplier;
+            settings.IdleSeconds = (int)Math.Max(1, Math.Min(86400, seconds));
+            settings.DisplayMinutes = idleUnit.SelectedIndex == 1;
+            settings.DimPercent = Decimal.ToInt32(brightnessValue.Value);
+            settings.AutoStart = autoStartCheck.Checked;
+            settings.SyncBlankScreenSaver = screenSaverCheck.Checked;
+        }
+
+        private void IdleUnitChanged(object sender, EventArgs e)
+        {
+            if (syncingIdleUnit || idleUnit.SelectedIndex < 0)
+            {
+                return;
+            }
+
+            syncingIdleUnit = true;
+            int oldMultiplier = lastIdleUnitIndex == 1 ? 60 : 1;
+            int newMultiplier = idleUnit.SelectedIndex == 1 ? 60 : 1;
+            decimal seconds = idleValue.Value * oldMultiplier;
+            idleValue.Maximum = idleUnit.SelectedIndex == 1 ? 1440 : 86400;
+            decimal converted = Math.Max(1, Math.Round(seconds / newMultiplier));
+            idleValue.Value = Math.Min(idleValue.Maximum, converted);
+            lastIdleUnitIndex = idleUnit.SelectedIndex;
+            syncingIdleUnit = false;
+        }
+
+        private void BrightnessSliderChanged(object sender, EventArgs e)
+        {
+            if (syncingBrightnessControls)
+            {
+                return;
+            }
+
+            syncingBrightnessControls = true;
+            brightnessValue.Value = brightnessSlider.Value;
+            syncingBrightnessControls = false;
+        }
+
+        private void BrightnessValueChanged(object sender, EventArgs e)
+        {
+            if (syncingBrightnessControls)
+            {
+                return;
+            }
+
+            syncingBrightnessControls = true;
+            brightnessSlider.Value = Decimal.ToInt32(brightnessValue.Value);
+            syncingBrightnessControls = false;
+        }
+
+        private void SetStatus(string text, Color color)
+        {
+            statusLabel.Text = text;
+            statusLabel.ForeColor = color;
+            statusDot.Tag = color;
+            statusDot.Invalidate();
+
+            string trayText = "外接显示器调光 - " + text;
+            trayIcon.Text = trayText.Length > 63 ? trayText.Substring(0, 63) : trayText;
+        }
+
+        private void UpdateMonitoringControls()
+        {
+            stopButton.Enabled = monitoring;
+            stopButton.ForeColor = monitoring ? TextPrimary : Inactive;
+            trayToggleItem.Text = monitoring ? "停止监控" : "开始监控";
+            applyButton.Text = monitoring ? "应用设置" : "应用并开始";
+        }
+
+        private void HideToTray()
+        {
+            SettingsStore.Log(String.Format(
+                "HideToTray called. Visible={0}, WindowState={1}.",
+                Visible,
+                WindowState));
+            Hide();
+            ShowInTaskbar = false;
+
+            if (!trayHintShown)
+            {
+                trayIcon.ShowBalloonTip(
+                    2000,
+                    "外接显示器休眠调光",
+                    "程序正在通知区域运行。",
+                    ToolTipIcon.Info);
+                trayHintShown = true;
+            }
+        }
+
+        private void ExitApplication()
+        {
+            allowExit = true;
+            Close();
+        }
+
+        private void FormClosingHandler(object sender, FormClosingEventArgs e)
+        {
+            if (!allowExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                HideToTray();
+                return;
+            }
+
+            monitorTimer.Stop();
+            monitoring = false;
+            RestoreSavedBrightness();
+            TryRestoreScreenSaver(false);
+        }
+
+        private void FormClosedHandler(object sender, FormClosedEventArgs e)
+        {
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            applicationIcon.Dispose();
+        }
+
+        private void FormResizeHandler(object sender, EventArgs e)
+        {
+            if (WindowState == FormWindowState.Minimized)
+            {
+                SettingsStore.Log("Window minimized; hiding to tray.");
+                HideToTray();
+            }
+        }
+
+        private void StatusDotPaint(object sender, PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            Color color = statusDot.Tag is Color ? (Color)statusDot.Tag : Inactive;
+            using (SolidBrush brush = new SolidBrush(color))
+            {
+                e.Graphics.FillEllipse(brush, 2, 2, 10, 10);
+            }
+        }
+
+        private void ResizeMonitorColumns()
+        {
+            if (monitorList.Columns.Count != 4 || monitorList.ClientSize.Width <= 0)
+            {
+                return;
+            }
+
+            int available = monitorList.ClientSize.Width - 8;
+            monitorList.Columns[0].Width = 128;
+            monitorList.Columns[2].Width = 104;
+            monitorList.Columns[3].Width = 92;
+            monitorList.Columns[1].Width = Math.Max(160, available - 324);
+        }
+
+        private Icon CreateApplicationIcon()
+        {
+            using (Bitmap bitmap = new Bitmap(32, 32))
+            using (Graphics graphics = Graphics.FromImage(bitmap))
+            {
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                graphics.Clear(Color.Transparent);
+
+                using (SolidBrush body = new SolidBrush(TextPrimary))
+                using (SolidBrush screen = new SolidBrush(Accent))
+                using (Pen stand = new Pen(TextPrimary, 2F))
+                {
+                    graphics.FillRectangle(body, 3, 5, 26, 18);
+                    graphics.FillRectangle(screen, 6, 8, 20, 12);
+                    graphics.DrawLine(stand, 16, 23, 16, 27);
+                    graphics.DrawLine(stand, 10, 28, 22, 28);
+                }
+
+                IntPtr handle = bitmap.GetHicon();
+                try
+                {
+                    return (Icon)Icon.FromHandle(handle).Clone();
+                }
+                finally
+                {
+                    NativeMethods.ReleaseIconHandle(handle);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,12 @@
+.vs/
+bin/
+obj/
+dist/
+
+*.suo
+*.user
+*.log
+Thumbs.db
+
+diagnostics*.txt
+gui-test-data*/
