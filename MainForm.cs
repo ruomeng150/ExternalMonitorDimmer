@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -10,6 +11,12 @@ namespace ExternalMonitorDimmer
 {
     internal sealed class MainForm : Form
     {
+        private const int ImmediateSleepHotKeyId = 0x454D;
+        private const int SupportedHotKeyModifiers =
+            NativeMethods.HotKeyModifierAlt |
+            NativeMethods.HotKeyModifierControl |
+            NativeMethods.HotKeyModifierShift;
+
         private static readonly Color WindowBackground = Color.FromArgb(247, 248, 246);
         private static readonly Color Surface = Color.White;
         private static readonly Color TextPrimary = Color.FromArgb(31, 37, 34);
@@ -31,6 +38,8 @@ namespace ExternalMonitorDimmer
         private NumericUpDown brightnessValue;
         private CheckBox autoStartCheck;
         private CheckBox screenSaverCheck;
+        private TextBox hotKeyText;
+        private Button clearHotKeyButton;
         private Label statusLabel;
         private Panel statusDot;
         private Label idleStatusLabel;
@@ -40,7 +49,9 @@ namespace ExternalMonitorDimmer
         private Button stopButton;
         private NotifyIcon trayIcon;
         private ToolStripMenuItem trayToggleItem;
+        private ToolStripMenuItem traySleepItem;
         private Icon applicationIcon;
+        private ToolTip toolTip;
 
         private bool monitoring;
         private bool dimmed;
@@ -49,7 +60,21 @@ namespace ExternalMonitorDimmer
         private bool trayHintShown;
         private bool syncingBrightnessControls;
         private bool syncingIdleUnit;
+        private bool hotKeyRegistered;
+        private bool immediateSleepPending;
+        private bool immediateSleepActive;
+        private bool immediateSleepTriggeredByMouse;
         private int lastIdleUnitIndex;
+        private int pendingHotKeyModifiers;
+        private int pendingHotKeyKey;
+        private int registeredHotKeyModifiers;
+        private int registeredHotKeyKey;
+        private int immediateSleepTriggerModifiers;
+        private int immediateSleepTriggerKey;
+        private uint immediateSleepInputTick;
+        private DateTime immediateSleepDueUtc = DateTime.MinValue;
+        private DateTime immediateSleepStartedUtc = DateTime.MinValue;
+        private Process immediateScreenSaverProcess;
         private DateTime nextDimAttemptUtc = DateTime.MinValue;
         private DateTime nextRestoreAttemptUtc = DateTime.MinValue;
         private DateTime nextStatusUpdateUtc = DateTime.MinValue;
@@ -65,13 +90,14 @@ namespace ExternalMonitorDimmer
             ForeColor = TextPrimary;
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(720, 594);
-            MinimumSize = new Size(660, 548);
+            ClientSize = new Size(720, 646);
+            MinimumSize = new Size(660, 600);
             AutoScaleMode = AutoScaleMode.Dpi;
             KeyPreview = true;
 
             applicationIcon = CreateApplicationIcon();
             Icon = applicationIcon;
+            toolTip = new ToolTip();
 
             BuildInterface();
             BuildTrayIcon();
@@ -105,7 +131,7 @@ namespace ExternalMonitorDimmer
             root.RowCount = 6;
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 1F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 188F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 240F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 1F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76F));
@@ -237,17 +263,51 @@ namespace ExternalMonitorDimmer
             percentLabel.Text = "%";
             panel.Controls.Add(percentLabel);
 
+            Label hotKeyLabel = new Label();
+            hotKeyLabel.AutoSize = true;
+            hotKeyLabel.Location = new Point(24, 118);
+            hotKeyLabel.ForeColor = TextSecondary;
+            hotKeyLabel.Text = "立即屏保快捷键";
+            panel.Controls.Add(hotKeyLabel);
+
+            hotKeyText = new TextBox();
+            hotKeyText.Location = new Point(24, 142);
+            hotKeyText.Size = new Size(250, 28);
+            hotKeyText.ReadOnly = true;
+            hotKeyText.ShortcutsEnabled = false;
+            hotKeyText.BackColor = Surface;
+            hotKeyText.ForeColor = TextPrimary;
+            hotKeyText.Cursor = Cursors.Hand;
+            hotKeyText.Font = new Font(Font.FontFamily, 10F, FontStyle.Regular, GraphicsUnit.Point);
+            hotKeyText.AccessibleName = "立即屏保快捷键";
+            hotKeyText.KeyDown += HotKeyTextKeyDown;
+            hotKeyText.Leave += delegate { UpdateHotKeyText(); };
+            toolTip.SetToolTip(hotKeyText, "单击后按下组合键；字母和数字需配合 Ctrl、Alt 或 Shift。");
+            panel.Controls.Add(hotKeyText);
+
+            clearHotKeyButton = CreateSecondaryButton("清除", 72);
+            clearHotKeyButton.Location = new Point(284, 136);
+            clearHotKeyButton.AccessibleName = "清除立即屏保快捷键";
+            clearHotKeyButton.Click += delegate
+            {
+                pendingHotKeyModifiers = 0;
+                pendingHotKeyKey = 0;
+                UpdateHotKeyText();
+                hotKeyText.Focus();
+            };
+            panel.Controls.Add(clearHotKeyButton);
+
             autoStartCheck = new CheckBox();
             autoStartCheck.AutoSize = true;
             autoStartCheck.FlatStyle = FlatStyle.Flat;
-            autoStartCheck.Location = new Point(24, 132);
+            autoStartCheck.Location = new Point(24, 196);
             autoStartCheck.Text = "登录 Windows 后自动运行";
             panel.Controls.Add(autoStartCheck);
 
             screenSaverCheck = new CheckBox();
             screenSaverCheck.AutoSize = true;
             screenSaverCheck.FlatStyle = FlatStyle.Flat;
-            screenSaverCheck.Location = new Point(340, 132);
+            screenSaverCheck.Location = new Point(340, 196);
             screenSaverCheck.Text = "同步使用黑屏屏保";
             panel.Controls.Add(screenSaverCheck);
 
@@ -389,6 +449,11 @@ namespace ExternalMonitorDimmer
             showItem.Click += delegate { ShowFromTray(); };
             menu.Items.Add(showItem);
 
+            traySleepItem = new ToolStripMenuItem("立即进入屏幕保护程序");
+            traySleepItem.Click += delegate { RequestImmediateScreenSaver(0, 0, true); };
+            menu.Items.Add(traySleepItem);
+            menu.Items.Add(new ToolStripSeparator());
+
             trayToggleItem = new ToolStripMenuItem("开始监控");
             trayToggleItem.Click += delegate
             {
@@ -437,6 +502,18 @@ namespace ExternalMonitorDimmer
 
             autoStartCheck.Checked = settings.AutoStart;
             screenSaverCheck.Checked = settings.SyncBlankScreenSaver;
+
+            if (IsValidHotKey(settings.HotKeyModifiers, settings.HotKeyKey))
+            {
+                pendingHotKeyModifiers = settings.HotKeyModifiers;
+                pendingHotKeyKey = settings.HotKeyKey;
+            }
+            else
+            {
+                pendingHotKeyModifiers = 0;
+                pendingHotKeyKey = 0;
+            }
+            UpdateHotKeyText();
         }
 
         private void FormShown(object sender, EventArgs e)
@@ -450,6 +527,7 @@ namespace ExternalMonitorDimmer
             RecoverSavedBrightness();
             RefreshMonitorList();
             monitorTimer.Start();
+            RegisterSavedHotKey();
 
             if (settings.MonitoringEnabled)
             {
@@ -502,6 +580,8 @@ namespace ExternalMonitorDimmer
         {
             try
             {
+                CancelImmediateScreenSaver();
+                ApplyHotKeyRegistration(pendingHotKeyModifiers, pendingHotKeyKey);
                 ReadSettingsFromControls();
                 StartupManager.SetEnabled(settings.AutoStart);
                 ApplyScreenSaverMode();
@@ -536,6 +616,7 @@ namespace ExternalMonitorDimmer
 
         private void StopMonitoring(bool persist)
         {
+            CancelImmediateScreenSaver();
             monitoring = false;
             RestoreSavedBrightness();
             TryRestoreScreenSaver(true);
@@ -549,6 +630,25 @@ namespace ExternalMonitorDimmer
             SetStatus("已停止", Inactive);
             UpdateMonitoringControls();
             SettingsStore.Log("Monitoring stopped.");
+        }
+
+        private void CancelImmediateScreenSaver()
+        {
+            bool wasActive = immediateSleepPending || immediateSleepActive;
+            immediateSleepPending = false;
+            immediateSleepActive = false;
+            immediateSleepTriggeredByMouse = false;
+            immediateSleepTriggerModifiers = 0;
+            immediateSleepTriggerKey = 0;
+            immediateSleepInputTick = 0;
+            immediateSleepDueUtc = DateTime.MinValue;
+            immediateSleepStartedUtc = DateTime.MinValue;
+            DisposeImmediateScreenSaverProcess();
+
+            if (wasActive)
+            {
+                SettingsStore.Log("Immediate screen saver cancelled.");
+            }
         }
 
         private void ApplyScreenSaverMode()
@@ -587,6 +687,293 @@ namespace ExternalMonitorDimmer
             }
         }
 
+        private void RegisterSavedHotKey()
+        {
+            try
+            {
+                ApplyHotKeyRegistration(pendingHotKeyModifiers, pendingHotKeyKey);
+            }
+            catch (Exception ex)
+            {
+                string message = "无法注册快捷键 " +
+                    FormatHotKey(pendingHotKeyModifiers, pendingHotKeyKey) +
+                    "，它可能已被其他程序占用。";
+                SettingsStore.Log("Hot key registration failed at startup: " + ex.Message);
+
+                if (startHidden)
+                {
+                    trayIcon.ShowBalloonTip(
+                        4000,
+                        "立即屏保快捷键不可用",
+                        message,
+                        ToolTipIcon.Warning);
+                }
+                else
+                {
+                    MessageBox.Show(
+                        this,
+                        message,
+                        "快捷键不可用",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
+        }
+
+        private void ApplyHotKeyRegistration(int modifiers, int key)
+        {
+            if (!IsValidHotKey(modifiers, key))
+            {
+                throw new InvalidOperationException("请选择有效的立即屏保快捷键。");
+            }
+
+            if (hotKeyRegistered &&
+                registeredHotKeyModifiers == modifiers &&
+                registeredHotKeyKey == key)
+            {
+                return;
+            }
+
+            bool hadPrevious = hotKeyRegistered;
+            int previousModifiers = registeredHotKeyModifiers;
+            int previousKey = registeredHotKeyKey;
+
+            if (hadPrevious)
+            {
+                NativeMethods.UnregisterGlobalHotKey(Handle, ImmediateSleepHotKeyId);
+                hotKeyRegistered = false;
+            }
+
+            try
+            {
+                if (key != 0)
+                {
+                    NativeMethods.RegisterGlobalHotKey(
+                        Handle,
+                        ImmediateSleepHotKeyId,
+                        (uint)modifiers,
+                        (uint)key);
+                    hotKeyRegistered = true;
+                }
+
+                registeredHotKeyModifiers = modifiers;
+                registeredHotKeyKey = key;
+                traySleepItem.ShortcutKeyDisplayString = key == 0
+                    ? String.Empty
+                    : FormatHotKey(modifiers, key);
+            }
+            catch (Exception ex)
+            {
+                registeredHotKeyModifiers = 0;
+                registeredHotKeyKey = 0;
+
+                if (hadPrevious)
+                {
+                    try
+                    {
+                        NativeMethods.RegisterGlobalHotKey(
+                            Handle,
+                            ImmediateSleepHotKeyId,
+                            (uint)previousModifiers,
+                            (uint)previousKey);
+                        hotKeyRegistered = true;
+                        registeredHotKeyModifiers = previousModifiers;
+                        registeredHotKeyKey = previousKey;
+                        traySleepItem.ShortcutKeyDisplayString =
+                            FormatHotKey(previousModifiers, previousKey);
+                    }
+                    catch (Exception restoreException)
+                    {
+                        SettingsStore.Log(
+                            "Could not restore previous hot key registration: " +
+                            restoreException.Message);
+                    }
+                }
+
+                throw new InvalidOperationException(
+                    "无法注册快捷键 " + FormatHotKey(modifiers, key) +
+                    "，它可能已被其他程序占用。",
+                    ex);
+            }
+        }
+
+        private void RequestImmediateScreenSaver(int modifiers, int key, bool triggeredByMouse)
+        {
+            if (immediateSleepPending || immediateSleepActive)
+            {
+                return;
+            }
+
+            immediateSleepPending = true;
+            immediateSleepTriggeredByMouse = triggeredByMouse;
+            immediateSleepTriggerModifiers = modifiers;
+            immediateSleepTriggerKey = key;
+            immediateSleepDueUtc = DateTime.MinValue;
+            SetStatus("准备进入屏保", Warning);
+            SettingsStore.Log("Immediate screen saver requested.");
+        }
+
+        private bool AreImmediateSleepTriggerKeysReleased()
+        {
+            if (immediateSleepTriggeredByMouse &&
+                (NativeMethods.IsKeyDown((int)Keys.LButton) ||
+                    NativeMethods.IsKeyDown((int)Keys.RButton)))
+            {
+                return false;
+            }
+
+            if (immediateSleepTriggerKey != 0 &&
+                NativeMethods.IsKeyDown(immediateSleepTriggerKey))
+            {
+                return false;
+            }
+
+            if ((immediateSleepTriggerModifiers & NativeMethods.HotKeyModifierControl) != 0 &&
+                NativeMethods.IsKeyDown((int)Keys.ControlKey))
+            {
+                return false;
+            }
+
+            if ((immediateSleepTriggerModifiers & NativeMethods.HotKeyModifierAlt) != 0 &&
+                NativeMethods.IsKeyDown((int)Keys.Menu))
+            {
+                return false;
+            }
+
+            return (immediateSleepTriggerModifiers & NativeMethods.HotKeyModifierShift) == 0 ||
+                !NativeMethods.IsKeyDown((int)Keys.ShiftKey);
+        }
+
+        private void PerformImmediateScreenSaver()
+        {
+            immediateSleepPending = false;
+            immediateSleepDueUtc = DateTime.MinValue;
+            busy = true;
+
+            try
+            {
+                if (!dimmed && !File.Exists(AppPaths.BrightnessStateFile) &&
+                    !DimMonitors())
+                {
+                    throw new InvalidOperationException("外接显示器亮度调节失败，未进入屏幕保护程序。");
+                }
+
+                DisposeImmediateScreenSaverProcess();
+                immediateScreenSaverProcess = ScreenSaverManager.StartBlank();
+                immediateSleepInputTick = NativeMethods.GetLastInputTickCount();
+                immediateSleepStartedUtc = DateTime.UtcNow;
+                immediateSleepActive = true;
+                SetStatus("屏幕保护程序中", Warning);
+                SettingsStore.Log("Immediate blank screen saver started.");
+            }
+            catch (Exception ex)
+            {
+                immediateSleepActive = false;
+                DisposeImmediateScreenSaverProcess();
+                RestoreSavedBrightness();
+                SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
+                SettingsStore.Log("Could not start immediate screen saver: " + ex.Message);
+
+                if (Visible)
+                {
+                    MessageBox.Show(
+                        this,
+                        ex.Message,
+                        "无法进入屏幕保护程序",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+                else
+                {
+                    trayIcon.ShowBalloonTip(
+                        4000,
+                        "无法进入屏幕保护程序",
+                        ex.Message,
+                        ToolTipIcon.Error);
+                }
+            }
+            finally
+            {
+                busy = false;
+            }
+        }
+
+        private bool ImmediateScreenSaverHasEnded(uint lastInputTick, DateTime now)
+        {
+            if (now >= immediateSleepStartedUtc.AddMilliseconds(350) &&
+                lastInputTick != immediateSleepInputTick)
+            {
+                return true;
+            }
+
+            if (immediateScreenSaverProcess == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                immediateScreenSaverProcess.Refresh();
+                return immediateScreenSaverProcess.HasExited;
+            }
+            catch (InvalidOperationException)
+            {
+                return true;
+            }
+        }
+
+        private void FinishImmediateScreenSaver()
+        {
+            immediateSleepActive = false;
+            DisposeImmediateScreenSaverProcess();
+
+            busy = true;
+            try
+            {
+                bool restored = RestoreSavedBrightness();
+                if (restored)
+                {
+                    SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
+                }
+                nextDimAttemptUtc = DateTime.UtcNow.AddSeconds(1);
+                SettingsStore.Log("Immediate screen saver ended; brightness restore attempted.");
+            }
+            finally
+            {
+                busy = false;
+            }
+        }
+
+        private void DisposeImmediateScreenSaverProcess()
+        {
+            if (immediateScreenSaverProcess == null)
+            {
+                return;
+            }
+
+            try
+            {
+                immediateScreenSaverProcess.Refresh();
+                if (!immediateScreenSaverProcess.HasExited)
+                {
+                    immediateScreenSaverProcess.Kill();
+                    immediateScreenSaverProcess.WaitForExit(500);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                SettingsStore.Log("Could not stop immediate screen saver: " + ex.Message);
+            }
+            finally
+            {
+                immediateScreenSaverProcess.Dispose();
+                immediateScreenSaverProcess = null;
+            }
+        }
+
         private void MonitorTimerTick(object sender, EventArgs e)
         {
             if (busy)
@@ -611,6 +998,47 @@ namespace ExternalMonitorDimmer
             {
                 idleStatusLabel.Text = String.Format("空闲 {0:0.0} 秒", idleMilliseconds / 1000.0);
                 nextStatusUpdateUtc = now.AddMilliseconds(500);
+            }
+
+            if (immediateSleepPending)
+            {
+                if (!AreImmediateSleepTriggerKeysReleased())
+                {
+                    immediateSleepDueUtc = DateTime.MinValue;
+                    return;
+                }
+
+                if (immediateSleepDueUtc == DateTime.MinValue)
+                {
+                    immediateSleepDueUtc = now.AddMilliseconds(450);
+                    return;
+                }
+
+                if (now >= immediateSleepDueUtc)
+                {
+                    PerformImmediateScreenSaver();
+                }
+                return;
+            }
+
+            if (immediateSleepActive)
+            {
+                uint lastInputTick;
+                try
+                {
+                    lastInputTick = NativeMethods.GetLastInputTickCount();
+                }
+                catch (Exception ex)
+                {
+                    SettingsStore.Log("Could not detect immediate screen saver wake: " + ex.Message);
+                    return;
+                }
+
+                if (ImmediateScreenSaverHasEnded(lastInputTick, now))
+                {
+                    FinishImmediateScreenSaver();
+                }
+                return;
             }
 
             if (!monitoring)
@@ -901,6 +1329,9 @@ namespace ExternalMonitorDimmer
             settings.DimPercent = Decimal.ToInt32(brightnessValue.Value);
             settings.AutoStart = autoStartCheck.Checked;
             settings.SyncBlankScreenSaver = screenSaverCheck.Checked;
+            settings.HotKeyModifiers = pendingHotKeyModifiers;
+            settings.HotKeyKey = pendingHotKeyKey;
+            settings.SettingsVersion = 2;
         }
 
         private void IdleUnitChanged(object sender, EventArgs e)
@@ -943,6 +1374,126 @@ namespace ExternalMonitorDimmer
             syncingBrightnessControls = true;
             brightnessSlider.Value = Decimal.ToInt32(brightnessValue.Value);
             syncingBrightnessControls = false;
+        }
+
+        private void HotKeyTextKeyDown(object sender, KeyEventArgs e)
+        {
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+
+            if (e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete || e.KeyCode == Keys.Escape)
+            {
+                pendingHotKeyModifiers = 0;
+                pendingHotKeyKey = 0;
+                UpdateHotKeyText();
+                return;
+            }
+
+            if (IsModifierKey(e.KeyCode))
+            {
+                hotKeyText.Text = "请再按一个按键";
+                return;
+            }
+
+            int modifiers = 0;
+            if (e.Control)
+            {
+                modifiers |= (int)NativeMethods.HotKeyModifierControl;
+            }
+            if (e.Alt)
+            {
+                modifiers |= (int)NativeMethods.HotKeyModifierAlt;
+            }
+            if (e.Shift)
+            {
+                modifiers |= (int)NativeMethods.HotKeyModifierShift;
+            }
+
+            if (!IsValidHotKey(modifiers, (int)e.KeyCode))
+            {
+                System.Media.SystemSounds.Beep.Play();
+                hotKeyText.Text = "字母/数字需配合 Ctrl 等";
+                hotKeyText.SelectAll();
+                return;
+            }
+
+            pendingHotKeyModifiers = modifiers;
+            pendingHotKeyKey = (int)e.KeyCode;
+            UpdateHotKeyText();
+        }
+
+        private void UpdateHotKeyText()
+        {
+            hotKeyText.Text = pendingHotKeyKey == 0
+                ? "未设置（点击录入）"
+                : FormatHotKey(pendingHotKeyModifiers, pendingHotKeyKey);
+            hotKeyText.Select(0, 0);
+        }
+
+        private static bool IsModifierKey(Keys key)
+        {
+            return key == Keys.ControlKey || key == Keys.LControlKey || key == Keys.RControlKey ||
+                key == Keys.Menu || key == Keys.LMenu || key == Keys.RMenu ||
+                key == Keys.ShiftKey || key == Keys.LShiftKey || key == Keys.RShiftKey ||
+                key == Keys.LWin || key == Keys.RWin;
+        }
+
+        private static bool IsValidHotKey(int modifiers, int key)
+        {
+            if ((modifiers & ~SupportedHotKeyModifiers) != 0)
+            {
+                return false;
+            }
+
+            if (key == 0)
+            {
+                return modifiers == 0;
+            }
+
+            Keys virtualKey = (Keys)key;
+            bool functionKey = virtualKey >= Keys.F1 && virtualKey <= Keys.F24;
+            return !IsModifierKey(virtualKey) && (modifiers != 0 || functionKey);
+        }
+
+        private static string FormatHotKey(int modifiers, int key)
+        {
+            if (key == 0)
+            {
+                return "未设置";
+            }
+
+            List<string> parts = new List<string>();
+            if ((modifiers & NativeMethods.HotKeyModifierControl) != 0)
+            {
+                parts.Add("Ctrl");
+            }
+            if ((modifiers & NativeMethods.HotKeyModifierAlt) != 0)
+            {
+                parts.Add("Alt");
+            }
+            if ((modifiers & NativeMethods.HotKeyModifierShift) != 0)
+            {
+                parts.Add("Shift");
+            }
+
+            Keys virtualKey = (Keys)key;
+            string keyName;
+            if (virtualKey >= Keys.D0 && virtualKey <= Keys.D9)
+            {
+                keyName = ((char)('0' + ((int)virtualKey - (int)Keys.D0))).ToString();
+            }
+            else if (virtualKey >= Keys.NumPad0 && virtualKey <= Keys.NumPad9)
+            {
+                keyName = "Num " +
+                    ((char)('0' + ((int)virtualKey - (int)Keys.NumPad0))).ToString();
+            }
+            else
+            {
+                keyName = virtualKey.ToString();
+            }
+
+            parts.Add(keyName);
+            return String.Join(" + ", parts.ToArray());
         }
 
         private void SetStatus(string text, Color color)
@@ -1001,6 +1552,12 @@ namespace ExternalMonitorDimmer
 
             monitorTimer.Stop();
             monitoring = false;
+            CancelImmediateScreenSaver();
+            if (hotKeyRegistered)
+            {
+                NativeMethods.UnregisterGlobalHotKey(Handle, ImmediateSleepHotKeyId);
+                hotKeyRegistered = false;
+            }
             RestoreSavedBrightness();
             TryRestoreScreenSaver(false);
         }
@@ -1009,7 +1566,23 @@ namespace ExternalMonitorDimmer
         {
             trayIcon.Visible = false;
             trayIcon.Dispose();
+            toolTip.Dispose();
             applicationIcon.Dispose();
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == NativeMethods.WmHotKey &&
+                message.WParam.ToInt32() == ImmediateSleepHotKeyId)
+            {
+                RequestImmediateScreenSaver(
+                    registeredHotKeyModifiers,
+                    registeredHotKeyKey,
+                    false);
+                return;
+            }
+
+            base.WndProc(ref message);
         }
 
         private void FormResizeHandler(object sender, EventArgs e)

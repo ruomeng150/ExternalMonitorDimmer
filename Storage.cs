@@ -19,6 +19,8 @@ namespace ExternalMonitorDimmer
         public bool AutoStart { get; set; }
         public bool SyncBlankScreenSaver { get; set; }
         public bool MonitoringEnabled { get; set; }
+        public int HotKeyModifiers { get; set; }
+        public int HotKeyKey { get; set; }
 
         public AppSettings()
         {
@@ -29,6 +31,8 @@ namespace ExternalMonitorDimmer
             AutoStart = false;
             SyncBlankScreenSaver = true;
             MonitoringEnabled = false;
+            HotKeyModifiers = 0;
+            HotKeyKey = 0;
         }
     }
 
@@ -136,13 +140,21 @@ namespace ExternalMonitorDimmer
                 return defaults;
             }
 
+            if (settings.SettingsVersion < 2)
+            {
+                settings.HotKeyModifiers = 0;
+                settings.HotKeyKey = 0;
+                settings.SettingsVersion = 2;
+                SaveSettings(settings);
+            }
+
             return settings;
         }
 
         private static AppSettings CreateDefaultSettings()
         {
             AppSettings settings = new AppSettings();
-            settings.SettingsVersion = 1;
+            settings.SettingsVersion = 2;
             return settings;
         }
 
@@ -349,6 +361,29 @@ namespace ExternalMonitorDimmer
             bool restoredActive = backup.Active.Exists && backup.Active.Value == "1";
             NativeMethods.ApplyScreenSaverTiming(restoredTimeout, restoredActive);
             SettingsStore.DeleteScreenSaverBackup();
+        }
+
+        public static Process StartBlank()
+        {
+            string screenSaver = Path.Combine(Environment.SystemDirectory, "scrnsave.scr");
+            if (!File.Exists(screenSaver))
+            {
+                throw new FileNotFoundException("找不到 Windows 黑屏屏保。", screenSaver);
+            }
+
+            ProcessStartInfo startInfo = new ProcessStartInfo();
+            startInfo.FileName = screenSaver;
+            startInfo.Arguments = "/s";
+            startInfo.UseShellExecute = false;
+            startInfo.CreateNoWindow = false;
+
+            Process process = Process.Start(startInfo);
+            if (process == null)
+            {
+                throw new InvalidOperationException("无法启动 Windows 黑屏屏保。");
+            }
+
+            return process;
         }
 
         private static RegistryValueBackup Capture(RegistryKey key, string name)
