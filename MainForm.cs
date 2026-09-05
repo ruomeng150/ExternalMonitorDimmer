@@ -16,6 +16,8 @@ namespace ExternalMonitorDimmer
             NativeMethods.HotKeyModifierAlt |
             NativeMethods.HotKeyModifierControl |
             NativeMethods.HotKeyModifierShift;
+        private const int TriggerModeIdle = 0;
+        private const int TriggerModeScreenSaver = 1;
 
         private static readonly Color WindowBackground = Color.FromArgb(247, 248, 246);
         private static readonly Color Surface = Color.White;
@@ -34,6 +36,7 @@ namespace ExternalMonitorDimmer
 
         private NumericUpDown idleValue;
         private ComboBox idleUnit;
+        private ComboBox triggerMode;
         private TrackBar brightnessSlider;
         private NumericUpDown brightnessValue;
         private CheckBox autoStartCheck;
@@ -79,6 +82,8 @@ namespace ExternalMonitorDimmer
         private DateTime nextDimAttemptUtc = DateTime.MinValue;
         private DateTime nextRestoreAttemptUtc = DateTime.MinValue;
         private DateTime nextStatusUpdateUtc = DateTime.MinValue;
+        private bool screenSaverStateKnown;
+        private bool lastScreenSaverRunning;
 
         public MainForm(bool startHidden)
         {
@@ -211,6 +216,26 @@ namespace ExternalMonitorDimmer
             heading.Font = new Font(Font.FontFamily, 11F, FontStyle.Bold, GraphicsUnit.Point);
             heading.Text = "自动调光";
             panel.Controls.Add(heading);
+
+            Label triggerModeLabel = new Label();
+            triggerModeLabel.AutoSize = true;
+            triggerModeLabel.Location = new Point(270, 18);
+            triggerModeLabel.ForeColor = TextSecondary;
+            triggerModeLabel.Text = "触发模式";
+            panel.Controls.Add(triggerModeLabel);
+
+            triggerMode = new ComboBox();
+            triggerMode.DropDownStyle = ComboBoxStyle.DropDownList;
+            triggerMode.FlatStyle = FlatStyle.Flat;
+            triggerMode.Items.Add("程序检测空闲时间");
+            triggerMode.Items.Add("跟随 Windows 屏幕保护程序");
+            triggerMode.Location = new Point(340, 11);
+            triggerMode.Size = new Size(286, 30);
+            triggerMode.AccessibleName = "触发模式";
+            triggerMode.SelectedIndexChanged += TriggerModeChanged;
+            toolTip.SetToolTip(triggerMode,
+                "程序检测模式使用下方的未操作时长；跟随模式由 Windows 屏幕保护程序负责启动。");
+            panel.Controls.Add(triggerMode);
 
             Label idleLabel = new Label();
             idleLabel.AutoSize = true;
@@ -495,6 +520,10 @@ namespace ExternalMonitorDimmer
 
         private void LoadSettingsIntoControls()
         {
+            triggerMode.SelectedIndex = settings.TriggerMode == TriggerModeScreenSaver
+                ? TriggerModeScreenSaver
+                : TriggerModeIdle;
+
             syncingIdleUnit = true;
             bool useMinutes = settings.DisplayMinutes && settings.IdleSeconds >= 60;
             idleUnit.SelectedIndex = useMinutes ? 1 : 0;
@@ -514,6 +543,7 @@ namespace ExternalMonitorDimmer
 
             autoStartCheck.Checked = settings.AutoStart;
             screenSaverCheck.Checked = settings.SyncBlankScreenSaver;
+            UpdateTriggerModeControls();
 
             if (IsValidHotKey(settings.HotKeyModifiers, settings.HotKeyKey))
             {
@@ -526,6 +556,33 @@ namespace ExternalMonitorDimmer
                 pendingHotKeyKey = 0;
             }
             UpdateHotKeyText();
+        }
+
+        private void TriggerModeChanged(object sender, EventArgs e)
+        {
+            UpdateTriggerModeControls();
+        }
+
+        private void UpdateTriggerModeControls()
+        {
+            bool useScreenSaver = triggerMode != null &&
+                triggerMode.SelectedIndex == TriggerModeScreenSaver;
+            idleValue.Enabled = !useScreenSaver;
+            idleUnit.Enabled = !useScreenSaver;
+            screenSaverCheck.Enabled = !useScreenSaver;
+
+            if (useScreenSaver)
+            {
+                screenSaverCheck.Checked = false;
+                toolTip.SetToolTip(screenSaverCheck,
+                    "跟随模式使用 Windows 自己的屏保设置，不会修改屏保超时或程序。");
+                idleStatusLabel.Text = "等待 Windows 屏保";
+            }
+            else
+            {
+                toolTip.SetToolTip(screenSaverCheck,
+                    "勾选后，程序会把 Windows 屏保同步为黑屏屏保并使用相同的未操作时长。");
+            }
         }
 
         private void FormShown(object sender, EventArgs e)
@@ -547,6 +604,7 @@ namespace ExternalMonitorDimmer
                 {
                     ApplyScreenSaverMode();
                     monitoring = true;
+                    screenSaverStateKnown = false;
                     SetStatus("监控中", Accent);
                     UpdateMonitoringControls();
                 }
@@ -607,10 +665,13 @@ namespace ExternalMonitorDimmer
                 SettingsStore.SaveSettings(settings);
                 monitoring = true;
                 nextDimAttemptUtc = DateTime.MinValue;
+                nextRestoreAttemptUtc = DateTime.MinValue;
+                screenSaverStateKnown = false;
                 SetStatus("监控中", Accent);
                 UpdateMonitoringControls();
                 SettingsStore.Log(String.Format(
-                    "Monitoring started. Idle={0}s, Dim={1}%.",
+                    "Monitoring started. Mode={0}, Idle={1}s, Dim={2}%.",
+                    settings.TriggerMode == TriggerModeScreenSaver ? "ScreenSaver" : "Idle",
                     settings.IdleSeconds,
                     settings.DimPercent));
             }
@@ -665,7 +726,7 @@ namespace ExternalMonitorDimmer
 
         private void ApplyScreenSaverMode()
         {
-            if (settings.SyncBlankScreenSaver)
+            if (settings.TriggerMode == TriggerModeIdle && settings.SyncBlankScreenSaver)
             {
                 ScreenSaverManager.EnableBlank(settings.IdleSeconds);
             }
@@ -996,23 +1057,26 @@ namespace ExternalMonitorDimmer
                 return;
             }
 
-            uint idleMilliseconds;
-            try
-            {
-                idleMilliseconds = NativeMethods.GetIdleMilliseconds();
-            }
-            catch (Exception ex)
-            {
-                SetStatus("输入检测失败", Error);
-                SettingsStore.Log("Input detection failed: " + ex.Message);
-                return;
-            }
-
             DateTime now = DateTime.UtcNow;
-            if (now >= nextStatusUpdateUtc)
+            uint idleMilliseconds = 0;
+            if (settings.TriggerMode == TriggerModeIdle)
             {
-                idleStatusLabel.Text = String.Format("空闲 {0:0.0} 秒", idleMilliseconds / 1000.0);
-                nextStatusUpdateUtc = now.AddMilliseconds(500);
+                try
+                {
+                    idleMilliseconds = NativeMethods.GetIdleMilliseconds();
+                }
+                catch (Exception ex)
+                {
+                    SetStatus("输入检测失败", Error);
+                    SettingsStore.Log("Input detection failed: " + ex.Message);
+                    return;
+                }
+
+                if (now >= nextStatusUpdateUtc)
+                {
+                    idleStatusLabel.Text = String.Format("空闲 {0:0.0} 秒", idleMilliseconds / 1000.0);
+                    nextStatusUpdateUtc = now.AddMilliseconds(500);
+                }
             }
 
             if (immediateSleepPending)
@@ -1063,6 +1127,12 @@ namespace ExternalMonitorDimmer
                 return;
             }
 
+            if (settings.TriggerMode == TriggerModeScreenSaver)
+            {
+                MonitorScreenSaver(now);
+                return;
+            }
+
             ulong threshold = (ulong)settings.IdleSeconds * 1000UL;
             if ((ulong)idleMilliseconds >= threshold)
             {
@@ -1080,6 +1150,85 @@ namespace ExternalMonitorDimmer
                     {
                         busy = false;
                     }
+                }
+            }
+            else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
+            {
+                if (now >= nextRestoreAttemptUtc)
+                {
+                    busy = true;
+                    try
+                    {
+                        RestoreSavedBrightness();
+                        nextRestoreAttemptUtc = now.AddSeconds(2);
+                    }
+                    finally
+                    {
+                        busy = false;
+                    }
+                }
+            }
+            else
+            {
+                SetStatus("监控中", Accent);
+            }
+        }
+
+        private void MonitorScreenSaver(DateTime now)
+        {
+            bool running;
+            try
+            {
+                running = NativeMethods.IsScreenSaverRunning();
+            }
+            catch (Exception ex)
+            {
+                SetStatus("屏保状态检测失败", Error);
+                SettingsStore.Log("Screen saver detection failed: " + ex.Message);
+                return;
+            }
+
+            if (now >= nextStatusUpdateUtc)
+            {
+                idleStatusLabel.Text = running
+                    ? "Windows 屏幕保护程序运行中"
+                    : "等待 Windows 屏幕保护程序";
+                nextStatusUpdateUtc = now.AddMilliseconds(500);
+            }
+
+            bool stateChanged = !screenSaverStateKnown || running != lastScreenSaverRunning;
+            screenSaverStateKnown = true;
+            lastScreenSaverRunning = running;
+
+            if (running)
+            {
+                if (!dimmed && !File.Exists(AppPaths.BrightnessStateFile) &&
+                    now >= nextDimAttemptUtc)
+                {
+                    busy = true;
+                    try
+                    {
+                        if (DimMonitors())
+                        {
+                            SetStatus("屏保中，已调暗", Warning);
+                        }
+                        else
+                        {
+                            nextDimAttemptUtc = now.AddSeconds(2);
+                        }
+                    }
+                    finally
+                    {
+                        busy = false;
+                    }
+                }
+                else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
+                {
+                    SetStatus("屏保中，已调暗", Warning);
+                }
+                else if (stateChanged)
+                {
+                    SetStatus("屏保中，准备调暗", Warning);
                 }
             }
             else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
@@ -1343,12 +1492,16 @@ namespace ExternalMonitorDimmer
             long seconds = Decimal.ToInt64(idleValue.Value) * multiplier;
             settings.IdleSeconds = (int)Math.Max(1, Math.Min(86400, seconds));
             settings.DisplayMinutes = idleUnit.SelectedIndex == 1;
+            settings.TriggerMode = triggerMode.SelectedIndex == TriggerModeScreenSaver
+                ? TriggerModeScreenSaver
+                : TriggerModeIdle;
             settings.DimPercent = Decimal.ToInt32(brightnessValue.Value);
             settings.AutoStart = autoStartCheck.Checked;
-            settings.SyncBlankScreenSaver = screenSaverCheck.Checked;
+            settings.SyncBlankScreenSaver = settings.TriggerMode == TriggerModeIdle &&
+                screenSaverCheck.Checked;
             settings.HotKeyModifiers = pendingHotKeyModifiers;
             settings.HotKeyKey = pendingHotKeyKey;
-            settings.SettingsVersion = 2;
+            settings.SettingsVersion = 3;
         }
 
         private void IdleUnitChanged(object sender, EventArgs e)

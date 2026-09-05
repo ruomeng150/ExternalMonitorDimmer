@@ -14,6 +14,7 @@ namespace ExternalMonitorDimmer
     {
         public int SettingsVersion { get; set; }
         public int IdleSeconds { get; set; }
+        public int TriggerMode { get; set; }
         public int DimPercent { get; set; }
         public bool DisplayMinutes { get; set; }
         public bool AutoStart { get; set; }
@@ -26,6 +27,7 @@ namespace ExternalMonitorDimmer
         {
             SettingsVersion = 0;
             IdleSeconds = 10;
+            TriggerMode = 0;
             DimPercent = 0;
             DisplayMinutes = false;
             AutoStart = false;
@@ -148,13 +150,24 @@ namespace ExternalMonitorDimmer
                 SaveSettings(settings);
             }
 
+            if (settings.TriggerMode != 1)
+            {
+                settings.TriggerMode = 0;
+            }
+
+            if (settings.SettingsVersion < 3)
+            {
+                settings.SettingsVersion = 3;
+                SaveSettings(settings);
+            }
+
             return settings;
         }
 
         private static AppSettings CreateDefaultSettings()
         {
             AppSettings settings = new AppSettings();
-            settings.SettingsVersion = 2;
+            settings.SettingsVersion = 3;
             return settings;
         }
 

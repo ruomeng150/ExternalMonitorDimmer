@@ -30,52 +30,70 @@ namespace ExternalMonitorDimmer
                     return;
                 }
 
-                Application.EnableVisualStyles();
-                Application.SetCompatibleTextRenderingDefault(false);
-                SettingsStore.Log("Application process started. Arguments=" + String.Join(" ", args));
-
-                bool startHidden = HasArgument(args, "--background");
-                using (EventWaitHandle showEvent = new EventWaitHandle(
-                    false,
-                    EventResetMode.AutoReset,
-                    ShowEventName))
-                using (MainForm form = new MainForm(startHidden))
-                {
-                    SettingsStore.Log("Main window constructed.");
-                    Thread showThread = new Thread(delegate()
-                    {
-                        while (!form.IsDisposed)
-                        {
-                            if (!showEvent.WaitOne(500))
-                            {
-                                continue;
-                            }
-
-                            try
-                            {
-                                form.BeginInvoke(new Action(form.ShowFromTray));
-                            }
-                            catch (InvalidOperationException)
-                            {
-                                return;
-                            }
-                        }
-                    });
-                    showThread.IsBackground = true;
-                    showThread.Name = "ExternalMonitorDimmer.ShowWindow";
-                    showThread.Start();
-
-                    SettingsStore.Log("Entering the Windows message loop.");
-                    Application.Run(form);
-                    SettingsStore.Log("Windows message loop exited.");
-                }
-
                 try
                 {
-                    mutex.ReleaseMutex();
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    SettingsStore.Log("Application process started. Arguments=" + String.Join(" ", args));
+
+                    bool startHidden = HasArgument(args, "--background");
+                    using (EventWaitHandle showEvent = new EventWaitHandle(
+                        false,
+                        EventResetMode.AutoReset,
+                        ShowEventName))
+                    using (MainForm form = new MainForm(startHidden))
+                    {
+                        SettingsStore.Log("Main window constructed.");
+                        Thread showThread = new Thread(delegate()
+                        {
+                            while (!form.IsDisposed)
+                            {
+                                if (!showEvent.WaitOne(500))
+                                {
+                                    continue;
+                                }
+
+                                try
+                                {
+                                    form.BeginInvoke(new Action(form.ShowFromTray));
+                                }
+                                catch (InvalidOperationException)
+                                {
+                                    return;
+                                }
+                            }
+                        });
+                        showThread.IsBackground = true;
+                        showThread.Name = "ExternalMonitorDimmer.ShowWindow";
+                        showThread.Start();
+
+                        SettingsStore.Log("Entering the Windows message loop.");
+                        Application.Run(form);
+                        SettingsStore.Log("Windows message loop exited.");
+                    }
+
+                    try
+                    {
+                        mutex.ReleaseMutex();
+                    }
+                    catch (ApplicationException)
+                    {
+                    }
                 }
-                catch (ApplicationException)
+                catch (Exception ex)
                 {
+                    SettingsStore.Log("Fatal application error: " + ex);
+                    try
+                    {
+                        MessageBox.Show(
+                            ex.Message,
+                            "外接显示器休眠调光",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                    }
+                    catch
+                    {
+                    }
                 }
             }
         }
@@ -125,6 +143,14 @@ namespace ExternalMonitorDimmer
             StringBuilder report = new StringBuilder();
             report.AppendLine("External Monitor Dimmer diagnostics");
             report.AppendLine("IdleMilliseconds=" + NativeMethods.GetIdleMilliseconds());
+            try
+            {
+                report.AppendLine("ScreenSaverRunning=" + NativeMethods.IsScreenSaverRunning());
+            }
+            catch (Exception ex)
+            {
+                report.AppendLine("ScreenSaverDetectionError=" + ex.Message);
+            }
 
             try
             {

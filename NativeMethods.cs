@@ -29,6 +29,7 @@ namespace ExternalMonitorDimmer
         private const uint HotKeyModifierNoRepeat = 0x4000;
         private const uint SpiSetScreenSaverTimeout = 0x000F;
         private const uint SpiSetScreenSaverActive = 0x0011;
+        private const uint SpiGetScreenSaverRunning = 0x0072;
         private const uint SpifUpdateIniFile = 0x0001;
         private const uint SpifSendChange = 0x0002;
 
@@ -142,6 +143,14 @@ namespace ExternalMonitorDimmer
             IntPtr value,
             uint updateFlags);
 
+        [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SystemParametersInfoGetScreenSaverRunning(
+            uint action,
+            uint parameter,
+            ref int value,
+            uint updateFlags);
+
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool DestroyIcon(IntPtr icon);
@@ -211,6 +220,21 @@ namespace ExternalMonitorDimmer
             }
 
             return info.Time;
+        }
+
+        public static bool IsScreenSaverRunning()
+        {
+            int running = 0;
+            if (!SystemParametersInfoGetScreenSaverRunning(
+                SpiGetScreenSaverRunning,
+                0,
+                ref running,
+                0))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            return running != 0;
         }
 
         public static void RegisterGlobalHotKey(
