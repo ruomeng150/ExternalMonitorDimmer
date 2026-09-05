@@ -61,6 +61,7 @@ namespace ExternalMonitorDimmer
         private bool syncingBrightnessControls;
         private bool syncingIdleUnit;
         private bool hotKeyRegistered;
+        private bool hotKeyChordDown;
         private bool immediateSleepPending;
         private bool immediateSleepActive;
         private bool immediateSleepTriggeredByMouse;
@@ -115,11 +116,22 @@ namespace ExternalMonitorDimmer
 
         public void ShowFromTray()
         {
+            bool rebindHotKey = hotKeyRegistered;
+            if (rebindHotKey)
+            {
+                UnregisterHotKeyForCurrentHandle();
+            }
+
             Show();
             ShowInTaskbar = true;
             WindowState = FormWindowState.Normal;
             Activate();
             BringToFront();
+
+            if (rebindHotKey)
+            {
+                RegisterSavedHotKey();
+            }
         }
 
         private void BuildInterface()
@@ -761,6 +773,9 @@ namespace ExternalMonitorDimmer
                 traySleepItem.ShortcutKeyDisplayString = key == 0
                     ? String.Empty
                     : FormatHotKey(modifiers, key);
+                SettingsStore.Log(key == 0
+                    ? "Immediate screen saver hot key cleared."
+                    : "Immediate screen saver hot key registered: " + FormatHotKey(modifiers, key));
             }
             catch (Exception ex)
             {
@@ -1020,6 +1035,8 @@ namespace ExternalMonitorDimmer
                 }
                 return;
             }
+
+            PollConfiguredHotKey();
 
             if (immediateSleepActive)
             {
@@ -1422,6 +1439,47 @@ namespace ExternalMonitorDimmer
             UpdateHotKeyText();
         }
 
+        private void PollConfiguredHotKey()
+        {
+            bool chordDown = IsConfiguredHotKeyDown();
+            if (chordDown && !hotKeyChordDown)
+            {
+                RequestImmediateScreenSaver(
+                    registeredHotKeyModifiers,
+                    registeredHotKeyKey,
+                    false);
+            }
+            hotKeyChordDown = chordDown;
+        }
+
+        private bool IsConfiguredHotKeyDown()
+        {
+            if (registeredHotKeyKey == 0)
+            {
+                return false;
+            }
+
+            if (!NativeMethods.IsKeyDown(registeredHotKeyKey))
+            {
+                return false;
+            }
+
+            if ((registeredHotKeyModifiers & NativeMethods.HotKeyModifierControl) != 0 &&
+                !NativeMethods.IsKeyDown((int)Keys.ControlKey))
+            {
+                return false;
+            }
+
+            if ((registeredHotKeyModifiers & NativeMethods.HotKeyModifierAlt) != 0 &&
+                !NativeMethods.IsKeyDown((int)Keys.Menu))
+            {
+                return false;
+            }
+
+            return (registeredHotKeyModifiers & NativeMethods.HotKeyModifierShift) == 0 ||
+                NativeMethods.IsKeyDown((int)Keys.ShiftKey);
+        }
+
         private void UpdateHotKeyText()
         {
             hotKeyText.Text = pendingHotKeyKey == 0
@@ -1521,8 +1579,19 @@ namespace ExternalMonitorDimmer
                 "HideToTray called. Visible={0}, WindowState={1}.",
                 Visible,
                 WindowState));
+            bool rebindHotKey = hotKeyRegistered;
+            if (rebindHotKey)
+            {
+                UnregisterHotKeyForCurrentHandle();
+            }
+
             Hide();
             ShowInTaskbar = false;
+
+            if (rebindHotKey)
+            {
+                RegisterSavedHotKey();
+            }
 
             if (!trayHintShown)
             {
@@ -1539,6 +1608,19 @@ namespace ExternalMonitorDimmer
         {
             allowExit = true;
             Close();
+        }
+
+        private void UnregisterHotKeyForCurrentHandle()
+        {
+            if (!hotKeyRegistered)
+            {
+                return;
+            }
+
+            NativeMethods.UnregisterGlobalHotKey(Handle, ImmediateSleepHotKeyId);
+            hotKeyRegistered = false;
+            hotKeyChordDown = false;
+            SettingsStore.Log("Immediate screen saver hot key unregistered for handle transition.");
         }
 
         private void FormClosingHandler(object sender, FormClosingEventArgs e)
@@ -1558,6 +1640,7 @@ namespace ExternalMonitorDimmer
                 NativeMethods.UnregisterGlobalHotKey(Handle, ImmediateSleepHotKeyId);
                 hotKeyRegistered = false;
             }
+            hotKeyChordDown = false;
             RestoreSavedBrightness();
             TryRestoreScreenSaver(false);
         }
@@ -1575,6 +1658,7 @@ namespace ExternalMonitorDimmer
             if (message.Msg == NativeMethods.WmHotKey &&
                 message.WParam.ToInt32() == ImmediateSleepHotKeyId)
             {
+                SettingsStore.Log("WM_HOTKEY received for immediate screen saver.");
                 RequestImmediateScreenSaver(
                     registeredHotKeyModifiers,
                     registeredHotKeyKey,
