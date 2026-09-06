@@ -18,6 +18,79 @@ namespace ExternalMonitorDimmer
         public uint Maximum { get; set; }
     }
 
+    internal sealed class AudioVolumeState
+    {
+        public float MasterVolumeScalar { get; set; }
+        public bool Muted { get; set; }
+    }
+
+    [ComImport]
+    [Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    internal class MMDeviceEnumeratorComObject
+    {
+    }
+
+    [ComImport]
+    [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IMMDeviceEnumerator
+    {
+        int EnumAudioEndpoints(int dataFlow, uint stateMask, out IMMDeviceCollection devices);
+        int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice endpoint);
+        int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+        int RegisterEndpointNotificationCallback(IntPtr client);
+        int UnregisterEndpointNotificationCallback(IntPtr client);
+    }
+
+    [ComImport]
+    [Guid("D666063F-1587-4E43-81F1-B948E807363F")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IMMDevice
+    {
+        int Activate(
+            ref Guid interfaceId,
+            uint context,
+            IntPtr activationParameters,
+            [MarshalAs(UnmanagedType.Interface)] out object interfaceObject);
+        int OpenPropertyStore(int access, out IntPtr properties);
+        int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        int GetState(out uint state);
+    }
+
+    [ComImport]
+    [Guid("0BD7A1BE-7A1A-44DB-8397-C0E6BDEAD2E9")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IMMDeviceCollection
+    {
+        int GetCount(out uint count);
+        int Item(uint index, out IMMDevice device);
+    }
+
+    [ComImport]
+    [Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IAudioEndpointVolume
+    {
+        int RegisterControlChangeNotify(IntPtr notify);
+        int UnregisterControlChangeNotify(IntPtr notify);
+        int GetChannelCount(out uint channelCount);
+        int SetMasterVolumeLevel(float levelDb, ref Guid eventContext);
+        int SetMasterVolumeLevelScalar(float level, ref Guid eventContext);
+        int GetMasterVolumeLevel(out float levelDb);
+        int GetMasterVolumeLevelScalar(out float level);
+        int SetChannelVolumeLevel(uint channelNumber, float levelDb, ref Guid eventContext);
+        int SetChannelVolumeLevelScalar(uint channelNumber, float level, ref Guid eventContext);
+        int GetChannelVolumeLevel(uint channelNumber, out float levelDb);
+        int GetChannelVolumeLevelScalar(uint channelNumber, out float level);
+        int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid eventContext);
+        int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+        int GetVolumeStepInfo(out uint step, out uint stepCount);
+        int VolumeStepUp(ref Guid eventContext);
+        int VolumeStepDown(ref Guid eventContext);
+        int QueryHardwareSupport(out uint hardwareSupportMask);
+        int GetVolumeRange(out float minDb, out float maxDb, out float incrementDb);
+    }
+
     internal static class NativeMethods
     {
         public const int WmHotKey = 0x0312;
@@ -36,6 +109,11 @@ namespace ExternalMonitorDimmer
         private const uint SpifUpdateIniFile = 0x0001;
         private const uint SpifSendChange = 0x0002;
         private const uint NotifyForThisSession = 0;
+        private const int AudioRenderDataFlow = 0;
+        private const int AudioMultimediaRole = 1;
+        private const uint ClsctxAll = 23;
+        private static readonly Guid AudioEndpointVolumeInterfaceId =
+            new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
 
         [StructLayout(LayoutKind.Sequential)]
         private struct LastInputInfo
@@ -300,6 +378,114 @@ namespace ExternalMonitorDimmer
         public static void UnregisterSessionNotifications(IntPtr window)
         {
             WTSUnRegisterSessionNotification(window);
+        }
+
+        public static AudioVolumeState MuteDefaultAudioEndpoint()
+        {
+            IMMDeviceEnumerator enumerator = null;
+            IMMDevice device = null;
+            IAudioEndpointVolume endpoint = null;
+            try
+            {
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+                CheckHResult(enumerator.GetDefaultAudioEndpoint(
+                    AudioRenderDataFlow,
+                    AudioMultimediaRole,
+                    out device));
+
+                Guid interfaceId = AudioEndpointVolumeInterfaceId;
+                object endpointObject;
+                CheckHResult(device.Activate(
+                    ref interfaceId,
+                    ClsctxAll,
+                    IntPtr.Zero,
+                    out endpointObject));
+                endpoint = endpointObject as IAudioEndpointVolume;
+                if (endpoint == null)
+                {
+                    throw new InvalidOperationException("无法访问 Windows 默认音频输出设备。");
+                }
+
+                float volume;
+                bool muted;
+                CheckHResult(endpoint.GetMasterVolumeLevelScalar(out volume));
+                CheckHResult(endpoint.GetMute(out muted));
+
+                Guid eventContext = Guid.Empty;
+                CheckHResult(endpoint.SetMute(true, ref eventContext));
+                return new AudioVolumeState
+                {
+                    MasterVolumeScalar = volume,
+                    Muted = muted
+                };
+            }
+            finally
+            {
+                ReleaseComObject(endpoint);
+                ReleaseComObject(device);
+                ReleaseComObject(enumerator);
+            }
+        }
+
+        public static void RestoreDefaultAudioEndpoint(AudioVolumeState state)
+        {
+            if (state == null)
+            {
+                return;
+            }
+
+            IMMDeviceEnumerator enumerator = null;
+            IMMDevice device = null;
+            IAudioEndpointVolume endpoint = null;
+            try
+            {
+                enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
+                CheckHResult(enumerator.GetDefaultAudioEndpoint(
+                    AudioRenderDataFlow,
+                    AudioMultimediaRole,
+                    out device));
+
+                Guid interfaceId = AudioEndpointVolumeInterfaceId;
+                object endpointObject;
+                CheckHResult(device.Activate(
+                    ref interfaceId,
+                    ClsctxAll,
+                    IntPtr.Zero,
+                    out endpointObject));
+                endpoint = endpointObject as IAudioEndpointVolume;
+                if (endpoint == null)
+                {
+                    throw new InvalidOperationException("无法访问 Windows 默认音频输出设备。");
+                }
+
+                Guid eventContext = Guid.Empty;
+                CheckHResult(endpoint.SetMasterVolumeLevelScalar(
+                    state.MasterVolumeScalar,
+                    ref eventContext));
+                CheckHResult(endpoint.SetMute(state.Muted, ref eventContext));
+            }
+            finally
+            {
+                ReleaseComObject(endpoint);
+                ReleaseComObject(device);
+                ReleaseComObject(enumerator);
+            }
+        }
+
+        private static void CheckHResult(int result)
+        {
+            if (result < 0)
+            {
+                Marshal.ThrowExceptionForHR(result);
+            }
+        }
+
+        private static void ReleaseComObject(object value)
+        {
+            if (value != null && Marshal.IsComObject(value))
+            {
+                Marshal.ReleaseComObject(value);
+            }
         }
 
         public static List<MonitorInfo> GetBrightnessMonitors()
