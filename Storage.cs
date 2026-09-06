@@ -19,6 +19,7 @@ namespace ExternalMonitorDimmer
         public bool DisplayMinutes { get; set; }
         public bool AutoStart { get; set; }
         public bool SyncBlankScreenSaver { get; set; }
+        public bool SyncLockWorkstation { get; set; }
         public bool MonitoringEnabled { get; set; }
         public int HotKeyModifiers { get; set; }
         public int HotKeyKey { get; set; }
@@ -32,6 +33,7 @@ namespace ExternalMonitorDimmer
             DisplayMinutes = false;
             AutoStart = false;
             SyncBlankScreenSaver = true;
+            SyncLockWorkstation = false;
             MonitoringEnabled = false;
             HotKeyModifiers = 0;
             HotKeyKey = 0;
@@ -161,13 +163,20 @@ namespace ExternalMonitorDimmer
                 SaveSettings(settings);
             }
 
+            if (settings.SettingsVersion < 4)
+            {
+                settings.SyncLockWorkstation = false;
+                settings.SettingsVersion = 4;
+                SaveSettings(settings);
+            }
+
             return settings;
         }
 
         private static AppSettings CreateDefaultSettings()
         {
             AppSettings settings = new AppSettings();
-            settings.SettingsVersion = 3;
+            settings.SettingsVersion = 4;
             return settings;
         }
 

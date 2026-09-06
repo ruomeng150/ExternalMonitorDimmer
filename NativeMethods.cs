@@ -21,6 +21,9 @@ namespace ExternalMonitorDimmer
     internal static class NativeMethods
     {
         public const int WmHotKey = 0x0312;
+        public const int WmWtsSessionChange = 0x02B1;
+        public const int WtsSessionLock = 0x0007;
+        public const int WtsSessionUnlock = 0x0008;
         public const int HotKeyModifierAlt = 0x0001;
         public const int HotKeyModifierControl = 0x0002;
         public const int HotKeyModifierShift = 0x0004;
@@ -32,6 +35,7 @@ namespace ExternalMonitorDimmer
         private const uint SpiGetScreenSaverRunning = 0x0072;
         private const uint SpifUpdateIniFile = 0x0001;
         private const uint SpifSendChange = 0x0002;
+        private const uint NotifyForThisSession = 0;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct LastInputInfo
@@ -114,6 +118,20 @@ namespace ExternalMonitorDimmer
 
         [DllImport("user32.dll")]
         private static extern short GetAsyncKeyState(int virtualKey);
+
+        [DllImport("user32.dll", EntryPoint = "LockWorkStation", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool LockWorkStationNative();
+
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool WTSRegisterSessionNotification(
+            IntPtr window,
+            uint flags);
+
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool WTSUnRegisterSessionNotification(IntPtr window);
 
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -261,6 +279,27 @@ namespace ExternalMonitorDimmer
         public static bool IsKeyDown(int virtualKey)
         {
             return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+        }
+
+        public static void LockWorkStation()
+        {
+            if (!LockWorkStationNative())
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+
+        public static void RegisterSessionNotifications(IntPtr window)
+        {
+            if (!WTSRegisterSessionNotification(window, NotifyForThisSession))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+
+        public static void UnregisterSessionNotifications(IntPtr window)
+        {
+            WTSUnRegisterSessionNotification(window);
         }
 
         public static List<MonitorInfo> GetBrightnessMonitors()

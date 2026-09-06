@@ -41,6 +41,7 @@ namespace ExternalMonitorDimmer
         private NumericUpDown brightnessValue;
         private CheckBox autoStartCheck;
         private CheckBox screenSaverCheck;
+        private CheckBox syncLockCheck;
         private TextBox hotKeyText;
         private Button clearHotKeyButton;
         private Label statusLabel;
@@ -84,6 +85,9 @@ namespace ExternalMonitorDimmer
         private DateTime nextStatusUpdateUtc = DateTime.MinValue;
         private bool screenSaverStateKnown;
         private bool lastScreenSaverRunning;
+        private bool sessionNotificationsRegistered;
+        private bool immediateSleepSyncLock;
+        private bool immediateSleepSessionLocked;
 
         public MainForm(bool startHidden)
         {
@@ -148,7 +152,7 @@ namespace ExternalMonitorDimmer
             root.RowCount = 6;
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 1F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 240F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 272F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 1F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76F));
@@ -348,6 +352,15 @@ namespace ExternalMonitorDimmer
             screenSaverCheck.Text = "同步使用黑屏屏保";
             panel.Controls.Add(screenSaverCheck);
 
+            syncLockCheck = new CheckBox();
+            syncLockCheck.AutoSize = true;
+            syncLockCheck.FlatStyle = FlatStyle.Flat;
+            syncLockCheck.Location = new Point(340, 224);
+            syncLockCheck.Text = "快捷键进入屏保时同步锁屏";
+            toolTip.SetToolTip(syncLockCheck,
+                "勾选后，使用自定义快捷键或托盘菜单进入屏保时会同时锁定 Windows；解锁后恢复亮度。此选项不影响自动调光。");
+            panel.Controls.Add(syncLockCheck);
+
             return panel;
         }
 
@@ -543,6 +556,7 @@ namespace ExternalMonitorDimmer
 
             autoStartCheck.Checked = settings.AutoStart;
             screenSaverCheck.Checked = settings.SyncBlankScreenSaver;
+            syncLockCheck.Checked = settings.SyncLockWorkstation;
             UpdateTriggerModeControls();
 
             if (IsValidHotKey(settings.HotKeyModifiers, settings.HotKeyKey))
@@ -596,6 +610,7 @@ namespace ExternalMonitorDimmer
             RecoverSavedBrightness();
             RefreshMonitorList();
             monitorTimer.Start();
+            RegisterSessionNotifications();
             RegisterSavedHotKey();
 
             if (settings.MonitoringEnabled)
@@ -710,6 +725,8 @@ namespace ExternalMonitorDimmer
             bool wasActive = immediateSleepPending || immediateSleepActive;
             immediateSleepPending = false;
             immediateSleepActive = false;
+            immediateSleepSyncLock = false;
+            immediateSleepSessionLocked = false;
             immediateSleepTriggeredByMouse = false;
             immediateSleepTriggerModifiers = 0;
             immediateSleepTriggerKey = 0;
@@ -722,6 +739,37 @@ namespace ExternalMonitorDimmer
             {
                 SettingsStore.Log("Immediate screen saver cancelled.");
             }
+        }
+
+        private void RegisterSessionNotifications()
+        {
+            if (sessionNotificationsRegistered || !IsHandleCreated)
+            {
+                return;
+            }
+
+            try
+            {
+                NativeMethods.RegisterSessionNotifications(Handle);
+                sessionNotificationsRegistered = true;
+                SettingsStore.Log("Session lock notifications registered.");
+            }
+            catch (Exception ex)
+            {
+                SettingsStore.Log("Could not register session lock notifications: " + ex.Message);
+            }
+        }
+
+        private void UnregisterSessionNotifications()
+        {
+            if (!sessionNotificationsRegistered || !IsHandleCreated)
+            {
+                return;
+            }
+
+            NativeMethods.UnregisterSessionNotifications(Handle);
+            sessionNotificationsRegistered = false;
+            SettingsStore.Log("Session lock notifications unregistered.");
         }
 
         private void ApplyScreenSaverMode()
@@ -925,9 +973,19 @@ namespace ExternalMonitorDimmer
             immediateSleepPending = false;
             immediateSleepDueUtc = DateTime.MinValue;
             busy = true;
+            bool syncLock = settings.SyncLockWorkstation;
 
             try
             {
+                if (syncLock)
+                {
+                    RegisterSessionNotifications();
+                    if (!sessionNotificationsRegistered)
+                    {
+                        throw new InvalidOperationException("无法监控 Windows 锁屏状态，未进入屏幕保护程序。");
+                    }
+                }
+
                 if (!dimmed && !File.Exists(AppPaths.BrightnessStateFile) &&
                     !DimMonitors())
                 {
@@ -939,12 +997,22 @@ namespace ExternalMonitorDimmer
                 immediateSleepInputTick = NativeMethods.GetLastInputTickCount();
                 immediateSleepStartedUtc = DateTime.UtcNow;
                 immediateSleepActive = true;
+                immediateSleepSyncLock = syncLock;
+                immediateSleepSessionLocked = false;
                 SetStatus("屏幕保护程序中", Warning);
                 SettingsStore.Log("Immediate blank screen saver started.");
+
+                if (syncLock)
+                {
+                    SettingsStore.Log("Requesting Windows workstation lock.");
+                    NativeMethods.LockWorkStation();
+                }
             }
             catch (Exception ex)
             {
                 immediateSleepActive = false;
+                immediateSleepSyncLock = false;
+                immediateSleepSessionLocked = false;
                 DisposeImmediateScreenSaverProcess();
                 RestoreSavedBrightness();
                 SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
@@ -976,6 +1044,13 @@ namespace ExternalMonitorDimmer
 
         private bool ImmediateScreenSaverHasEnded(uint lastInputTick, DateTime now)
         {
+            if (immediateSleepSyncLock)
+            {
+                // LockWorkStation can close scrnsave.scr and input timestamps can change;
+                // the unlock session notification is the authoritative wake signal here.
+                return false;
+            }
+
             if (now >= immediateSleepStartedUtc.AddMilliseconds(350) &&
                 lastInputTick != immediateSleepInputTick)
             {
@@ -1001,6 +1076,8 @@ namespace ExternalMonitorDimmer
         private void FinishImmediateScreenSaver()
         {
             immediateSleepActive = false;
+            immediateSleepSyncLock = false;
+            immediateSleepSessionLocked = false;
             DisposeImmediateScreenSaverProcess();
 
             busy = true;
@@ -1499,9 +1576,10 @@ namespace ExternalMonitorDimmer
             settings.AutoStart = autoStartCheck.Checked;
             settings.SyncBlankScreenSaver = settings.TriggerMode == TriggerModeIdle &&
                 screenSaverCheck.Checked;
+            settings.SyncLockWorkstation = syncLockCheck.Checked;
             settings.HotKeyModifiers = pendingHotKeyModifiers;
             settings.HotKeyKey = pendingHotKeyKey;
-            settings.SettingsVersion = 3;
+            settings.SettingsVersion = 4;
         }
 
         private void IdleUnitChanged(object sender, EventArgs e)
@@ -1800,6 +1878,7 @@ namespace ExternalMonitorDimmer
 
         private void FormClosedHandler(object sender, FormClosedEventArgs e)
         {
+            UnregisterSessionNotifications();
             trayIcon.Visible = false;
             trayIcon.Dispose();
             toolTip.Dispose();
@@ -1808,6 +1887,29 @@ namespace ExternalMonitorDimmer
 
         protected override void WndProc(ref Message message)
         {
+            if (message.Msg == NativeMethods.WmWtsSessionChange)
+            {
+                int sessionState = message.WParam.ToInt32();
+                if (sessionState == NativeMethods.WtsSessionLock &&
+                    immediateSleepActive && immediateSleepSyncLock)
+                {
+                    immediateSleepSessionLocked = true;
+                    SetStatus("已锁屏，亮度保持最低", Warning);
+                    SettingsStore.Log("Windows workstation locked for immediate screen saver.");
+                    return;
+                }
+
+                if (sessionState == NativeMethods.WtsSessionUnlock &&
+                    immediateSleepActive && immediateSleepSyncLock)
+                {
+                    SettingsStore.Log(immediateSleepSessionLocked
+                        ? "Windows workstation unlocked; restoring brightness."
+                        : "Windows workstation unlock received before lock notification; restoring brightness.");
+                    FinishImmediateScreenSaver();
+                    return;
+                }
+            }
+
             if (message.Msg == NativeMethods.WmHotKey &&
                 message.WParam.ToInt32() == ImmediateSleepHotKeyId)
             {
