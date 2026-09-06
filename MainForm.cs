@@ -43,7 +43,6 @@ namespace ExternalMonitorDimmer
         private CheckBox screenSaverCheck;
         private CheckBox syncLockCheck;
         private CheckBox syncMuteCheck;
-        private NumericUpDown lockDelayValue;
         private TextBox hotKeyText;
         private Button clearHotKeyButton;
         private Label statusLabel;
@@ -91,10 +90,8 @@ namespace ExternalMonitorDimmer
         private bool immediateSleepSyncLock;
         private bool immediateSleepSessionLocked;
         private bool immediateSleepSyncMute;
-        private bool immediateSleepScreenSaverStarted;
-        private bool immediateSleepScreenSaverAttempted;
         private AudioVolumeState immediateSleepAudioState;
-        private DateTime immediateSleepScreenSaverDueUtc = DateTime.MinValue;
+        private bool immediateSleepLockRequested;
 
         public MainForm(bool startHidden)
         {
@@ -363,43 +360,19 @@ namespace ExternalMonitorDimmer
             syncLockCheck.AutoSize = true;
             syncLockCheck.FlatStyle = FlatStyle.Flat;
             syncLockCheck.Location = new Point(340, 224);
-            syncLockCheck.Text = "快捷键进入屏保时同步锁屏";
+            syncLockCheck.Text = "在恢复时显示登录屏幕";
             toolTip.SetToolTip(syncLockCheck,
-                "勾选后，使用自定义快捷键或托盘菜单进入屏保时会同时锁定 Windows；解锁后恢复亮度。此选项不影响自动调光。");
+                "仅对自定义快捷键启动的屏保生效；退出屏保后锁定 Windows 并显示登录屏幕。不会干预 Windows 自带屏保或托盘菜单。此选项不影响自动调光。");
             syncLockCheck.CheckedChanged += delegate { UpdateSyncLockControls(); };
             panel.Controls.Add(syncLockCheck);
-
-            Label lockDelayLabel = new Label();
-            lockDelayLabel.AutoSize = true;
-            lockDelayLabel.Location = new Point(24, 228);
-            lockDelayLabel.ForeColor = TextSecondary;
-            lockDelayLabel.Text = "锁屏后启动屏保延迟";
-            panel.Controls.Add(lockDelayLabel);
-
-            lockDelayValue = new NumericUpDown();
-            lockDelayValue.Location = new Point(160, 220);
-            lockDelayValue.Size = new Size(72, 28);
-            lockDelayValue.Minimum = 0;
-            lockDelayValue.Maximum = 30;
-            lockDelayValue.TextAlign = HorizontalAlignment.Right;
-            lockDelayValue.Font = new Font(Font.FontFamily, 10F, FontStyle.Regular, GraphicsUnit.Point);
-            lockDelayValue.AccessibleName = "锁屏后启动屏保延迟秒数";
-            toolTip.SetToolTip(lockDelayValue, "同步锁屏后等待指定秒数，再启动黑屏屏保；设为 0 表示立即启动。");
-            panel.Controls.Add(lockDelayValue);
-
-            Label lockDelayUnitLabel = new Label();
-            lockDelayUnitLabel.AutoSize = true;
-            lockDelayUnitLabel.Location = new Point(238, 228);
-            lockDelayUnitLabel.Text = "秒";
-            panel.Controls.Add(lockDelayUnitLabel);
 
             syncMuteCheck = new CheckBox();
             syncMuteCheck.AutoSize = true;
             syncMuteCheck.FlatStyle = FlatStyle.Flat;
-            syncMuteCheck.Location = new Point(340, 280);
+            syncMuteCheck.Location = new Point(340, 252);
             syncMuteCheck.Text = "锁屏后同步静音";
             toolTip.SetToolTip(syncMuteCheck,
-                "需要同时启用同步锁屏；锁屏后静音 Windows 默认音频输出，解锁后恢复原音量和静音状态。");
+                "仅在启用“在恢复时显示登录屏幕”时生效；程序锁屏后静音默认音频输出，解锁后恢复原音量和静音状态。不会干预 Windows 自带屏保。");
             panel.Controls.Add(syncMuteCheck);
 
             return panel;
@@ -599,7 +572,6 @@ namespace ExternalMonitorDimmer
             screenSaverCheck.Checked = settings.SyncBlankScreenSaver;
             syncLockCheck.Checked = settings.SyncLockWorkstation;
             syncMuteCheck.Checked = settings.SyncMuteWorkstation;
-            lockDelayValue.Value = Math.Max(0, Math.Min(30, settings.LockScreenSaverDelaySeconds));
             UpdateTriggerModeControls();
 
             if (IsValidHotKey(settings.HotKeyModifiers, settings.HotKeyKey))
@@ -645,12 +617,11 @@ namespace ExternalMonitorDimmer
 
         private void UpdateSyncLockControls()
         {
-            if (lockDelayValue == null || syncLockCheck == null)
+            if (syncMuteCheck == null || syncLockCheck == null)
             {
                 return;
             }
 
-            lockDelayValue.Enabled = syncLockCheck.Checked;
             syncMuteCheck.Enabled = syncLockCheck.Checked;
         }
 
@@ -784,15 +755,13 @@ namespace ExternalMonitorDimmer
             immediateSleepSyncLock = false;
             immediateSleepSessionLocked = false;
             immediateSleepSyncMute = false;
-            immediateSleepScreenSaverStarted = false;
-            immediateSleepScreenSaverAttempted = false;
+            immediateSleepLockRequested = false;
             immediateSleepTriggeredByMouse = false;
             immediateSleepTriggerModifiers = 0;
             immediateSleepTriggerKey = 0;
             immediateSleepInputTick = 0;
             immediateSleepDueUtc = DateTime.MinValue;
             immediateSleepStartedUtc = DateTime.MinValue;
-            immediateSleepScreenSaverDueUtc = DateTime.MinValue;
             DisposeImmediateScreenSaverProcess();
 
             if (wasActive)
@@ -832,9 +801,9 @@ namespace ExternalMonitorDimmer
             SettingsStore.Log("Session lock notifications unregistered.");
         }
 
-        private bool TryMuteImmediateSleepAudio()
+        private bool TryMuteWorkstationAudio(bool enabled)
         {
-            if (!immediateSleepSyncMute || immediateSleepAudioState != null)
+            if (!enabled || immediateSleepAudioState != null)
             {
                 return true;
             }
@@ -842,7 +811,7 @@ namespace ExternalMonitorDimmer
             try
             {
                 immediateSleepAudioState = NativeMethods.MuteDefaultAudioEndpoint();
-                SettingsStore.Log("Windows default audio endpoint muted for immediate screen saver.");
+                SettingsStore.Log("Windows default audio endpoint muted for workstation lock.");
                 return true;
             }
             catch (Exception ex)
@@ -1075,7 +1044,7 @@ namespace ExternalMonitorDimmer
             immediateSleepPending = false;
             immediateSleepDueUtc = DateTime.MinValue;
             busy = true;
-            bool syncLock = settings.SyncLockWorkstation;
+            bool syncLock = !immediateSleepTriggeredByMouse && settings.SyncLockWorkstation;
             bool syncMute = syncLock && settings.SyncMuteWorkstation;
 
             try
@@ -1100,20 +1069,14 @@ namespace ExternalMonitorDimmer
                 immediateSleepSyncLock = syncLock;
                 immediateSleepSessionLocked = false;
                 immediateSleepSyncMute = syncMute;
+                immediateSleepLockRequested = false;
+                immediateSleepActive = true;
                 if (syncLock)
                 {
-                    immediateSleepActive = true;
-                    immediateSleepScreenSaverStarted = false;
-                    immediateSleepScreenSaverAttempted = false;
-                    immediateSleepScreenSaverDueUtc = DateTime.MinValue;
-                    SetStatus("正在锁屏", Warning);
-                    SettingsStore.Log("Requesting Windows workstation lock before starting screen saver.");
-                    NativeMethods.LockWorkStation();
+                    SetStatus("准备显示屏保，退出后显示登录屏幕", Warning);
+                    SettingsStore.Log("Starting screen saver before requesting Windows workstation lock.");
                 }
-                else
-                {
-                    StartImmediateScreenSaverProcess();
-                }
+                StartImmediateScreenSaverProcess();
             }
             catch (Exception ex)
             {
@@ -1121,9 +1084,7 @@ namespace ExternalMonitorDimmer
                 immediateSleepSyncLock = false;
                 immediateSleepSessionLocked = false;
                 immediateSleepSyncMute = false;
-                immediateSleepScreenSaverStarted = false;
-                immediateSleepScreenSaverAttempted = false;
-                immediateSleepScreenSaverDueUtc = DateTime.MinValue;
+                immediateSleepLockRequested = false;
                 DisposeImmediateScreenSaverProcess();
                 RestoreSavedBrightness();
                 SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
@@ -1156,46 +1117,46 @@ namespace ExternalMonitorDimmer
         private void StartImmediateScreenSaverProcess()
         {
             DisposeImmediateScreenSaverProcess();
-            immediateSleepScreenSaverAttempted = true;
             immediateScreenSaverProcess = ScreenSaverManager.StartBlank();
-            immediateSleepScreenSaverStarted = true;
             immediateSleepStartedUtc = DateTime.UtcNow;
             immediateSleepActive = true;
             SetStatus(
                 immediateSleepSyncLock
-                    ? "已锁屏，屏保中，亮度保持最低"
+                    ? "屏保中，退出后显示登录屏幕"
                     : "屏幕保护程序中",
                 Warning);
             SettingsStore.Log("Immediate blank screen saver started.");
         }
 
-        private void TryStartDelayedImmediateScreenSaver(DateTime now)
+        private void RequestLockAfterImmediateScreenSaver(bool brightnessRestored)
         {
             if (!immediateSleepActive || !immediateSleepSyncLock ||
-                !immediateSleepSessionLocked || immediateSleepScreenSaverStarted ||
-                immediateSleepScreenSaverAttempted ||
-                now < immediateSleepScreenSaverDueUtc)
+                immediateSleepLockRequested)
             {
                 return;
             }
 
             busy = true;
-            immediateSleepScreenSaverAttempted = true;
             try
             {
                 DisposeImmediateScreenSaverProcess();
-                immediateScreenSaverProcess = ScreenSaverManager.StartBlank();
-                immediateSleepScreenSaverStarted = true;
-                SetStatus("已锁屏，屏保中，亮度保持最低", Warning);
-                SettingsStore.Log(String.Format(
-                    "Immediate blank screen saver started after {0}s lock delay.",
-                    settings.LockScreenSaverDelaySeconds));
+                immediateSleepLockRequested = true;
+                immediateSleepSessionLocked = false;
+                SetStatus(
+                    brightnessRestored
+                        ? "亮度已恢复，正在显示登录屏幕"
+                        : "亮度恢复失败，正在显示登录屏幕",
+                    brightnessRestored ? Warning : Error);
+                SettingsStore.Log("Immediate screen saver exited; requesting Windows workstation lock.");
+                NativeMethods.LockWorkStation();
+                SettingsStore.Log("Windows workstation lock requested immediately after screen saver exit.");
             }
             catch (Exception ex)
             {
-                immediateSleepScreenSaverStarted = false;
-                SetStatus("已锁屏，屏保启动失败", Error);
-                SettingsStore.Log("Could not start delayed screen saver while locked: " + ex.Message);
+                immediateSleepLockRequested = false;
+                SetStatus("锁屏失败，正在恢复亮度", Error);
+                SettingsStore.Log("Could not lock workstation after immediate screen saver: " + ex.Message);
+                FinishImmediateScreenSaver();
             }
             finally
             {
@@ -1205,32 +1166,63 @@ namespace ExternalMonitorDimmer
 
         private bool ImmediateScreenSaverHasEnded(uint lastInputTick, DateTime now)
         {
-            if (immediateSleepSyncLock)
+            if (immediateSleepLockRequested)
             {
-                // LockWorkStation can close scrnsave.scr and input timestamps can change;
-                // the unlock session notification is the authoritative wake signal here.
+                // The unlock session notification is the authoritative wake signal once
+                // LockWorkStation has been requested.
                 return false;
             }
 
-            if (now >= immediateSleepStartedUtc.AddMilliseconds(350) &&
-                lastInputTick != immediateSleepInputTick)
+            if (immediateScreenSaverProcess != null)
             {
-                return true;
+                try
+                {
+                    immediateScreenSaverProcess.Refresh();
+                    if (immediateScreenSaverProcess.HasExited)
+                    {
+                        return true;
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    return true;
+                }
             }
 
-            if (immediateScreenSaverProcess == null)
+            // Input can change while scrnsave.scr is still starting. Only use it as
+            // a fallback after confirming that Windows no longer reports a screen saver.
+            if (now < immediateSleepStartedUtc.AddMilliseconds(350) ||
+                lastInputTick == immediateSleepInputTick)
             {
                 return false;
             }
 
             try
             {
-                immediateScreenSaverProcess.Refresh();
-                return immediateScreenSaverProcess.HasExited;
+                return !NativeMethods.IsScreenSaverRunning();
             }
-            catch (InvalidOperationException)
+            catch (Exception ex)
             {
-                return true;
+                SettingsStore.Log("Could not confirm screen saver exit: " + ex.Message);
+                return false;
+            }
+        }
+
+        private bool RestoreBrightnessAfterImmediateScreenSaverExit()
+        {
+            busy = true;
+            try
+            {
+                bool restored = RestoreSavedBrightness();
+                nextDimAttemptUtc = DateTime.UtcNow.AddSeconds(1);
+                SettingsStore.Log(restored
+                    ? "Immediate screen saver exited; brightness restored before workstation lock."
+                    : "Immediate screen saver exited; brightness restore is pending before workstation lock.");
+                return restored;
+            }
+            finally
+            {
+                busy = false;
             }
         }
 
@@ -1240,9 +1232,7 @@ namespace ExternalMonitorDimmer
             immediateSleepSyncLock = false;
             immediateSleepSessionLocked = false;
             immediateSleepSyncMute = false;
-            immediateSleepScreenSaverStarted = false;
-            immediateSleepScreenSaverAttempted = false;
-            immediateSleepScreenSaverDueUtc = DateTime.MinValue;
+            immediateSleepLockRequested = false;
             DisposeImmediateScreenSaverProcess();
 
             busy = true;
@@ -1347,12 +1337,6 @@ namespace ExternalMonitorDimmer
 
             if (immediateSleepActive)
             {
-                if (immediateSleepSyncLock)
-                {
-                    TryStartDelayedImmediateScreenSaver(now);
-                    return;
-                }
-
                 uint lastInputTick;
                 try
                 {
@@ -1366,7 +1350,15 @@ namespace ExternalMonitorDimmer
 
                 if (ImmediateScreenSaverHasEnded(lastInputTick, now))
                 {
-                    FinishImmediateScreenSaver();
+                    if (!immediateSleepSyncLock)
+                    {
+                        FinishImmediateScreenSaver();
+                    }
+                    else
+                    {
+                        bool restored = RestoreBrightnessAfterImmediateScreenSaverExit();
+                        RequestLockAfterImmediateScreenSaver(restored);
+                    }
                 }
                 return;
             }
@@ -1750,10 +1742,9 @@ namespace ExternalMonitorDimmer
                 screenSaverCheck.Checked;
             settings.SyncLockWorkstation = syncLockCheck.Checked;
             settings.SyncMuteWorkstation = syncLockCheck.Checked && syncMuteCheck.Checked;
-            settings.LockScreenSaverDelaySeconds = Decimal.ToInt32(lockDelayValue.Value);
             settings.HotKeyModifiers = pendingHotKeyModifiers;
             settings.HotKeyKey = pendingHotKeyKey;
-            settings.SettingsVersion = 6;
+            settings.SettingsVersion = 7;
         }
 
         private void IdleUnitChanged(object sender, EventArgs e)
@@ -2064,30 +2055,34 @@ namespace ExternalMonitorDimmer
             if (message.Msg == NativeMethods.WmWtsSessionChange)
             {
                 int sessionState = message.WParam.ToInt32();
-                if (sessionState == NativeMethods.WtsSessionLock &&
-                    immediateSleepActive && immediateSleepSyncLock)
+                if (sessionState == NativeMethods.WtsSessionLock)
                 {
-                    immediateSleepSessionLocked = true;
-                    bool muted = TryMuteImmediateSleepAudio();
-                    immediateSleepScreenSaverDueUtc = DateTime.UtcNow.AddSeconds(
-                        settings.LockScreenSaverDelaySeconds);
-                    SetStatus(
-                        muted ? "已锁屏，亮度保持最低" : "已锁屏，静音失败",
-                        muted ? Warning : Error);
-                    SettingsStore.Log(String.Format(
-                        "Windows workstation locked; screen saver delayed by {0}s.",
-                        settings.LockScreenSaverDelaySeconds));
-                    return;
+                    if (immediateSleepActive && immediateSleepSyncLock &&
+                        immediateSleepLockRequested)
+                    {
+                        bool muted = TryMuteWorkstationAudio(immediateSleepSyncMute);
+                        immediateSleepSessionLocked = true;
+                        SetStatus(
+                            muted ? "已锁屏，登录屏幕中" : "已锁屏，静音失败",
+                            muted ? Warning : Error);
+                        SettingsStore.Log(muted
+                            ? "Windows workstation locked after immediate screen saver exit; default audio endpoint muted."
+                            : "Windows workstation locked after immediate screen saver exit; default audio endpoint mute failed.");
+                        return;
+                    }
                 }
 
-                if (sessionState == NativeMethods.WtsSessionUnlock &&
-                    immediateSleepActive && immediateSleepSyncLock)
+                if (sessionState == NativeMethods.WtsSessionUnlock)
                 {
-                    SettingsStore.Log(immediateSleepSessionLocked
-                        ? "Windows workstation unlocked; restoring brightness."
-                        : "Windows workstation unlock received before lock notification; restoring brightness.");
-                    FinishImmediateScreenSaver();
-                    return;
+                    if (immediateSleepActive && immediateSleepSyncLock &&
+                        immediateSleepLockRequested)
+                    {
+                        SettingsStore.Log(immediateSleepSessionLocked
+                            ? "Windows workstation unlocked; restoring brightness."
+                            : "Windows workstation unlock received before lock notification; restoring brightness.");
+                        FinishImmediateScreenSaver();
+                        return;
+                    }
                 }
             }
 
