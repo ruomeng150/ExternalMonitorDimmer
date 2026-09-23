@@ -24,6 +24,7 @@ if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
 $sources = @(
     (Join-Path $PSScriptRoot 'Program.cs'),
     (Join-Path $PSScriptRoot 'NativeMethods.cs'),
+    (Join-Path $PSScriptRoot 'WmiBrightnessProvider.cs'),
     (Join-Path $PSScriptRoot 'Storage.cs'),
     (Join-Path $PSScriptRoot 'MainForm.cs'),
     (Join-Path $PSScriptRoot 'AssemblyInfo.cs')
@@ -40,6 +41,7 @@ $arguments = @(
     ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')),
     '/reference:System.dll',
     '/reference:System.Core.dll',
+    '/reference:System.Management.dll',
     '/reference:System.Drawing.dll',
     '/reference:System.Windows.Forms.dll',
     '/reference:System.Xml.dll'

@@ -33,6 +33,8 @@ namespace ExternalMonitorDimmer
         private readonly bool startHidden;
         private readonly AppSettings settings;
         private readonly System.Windows.Forms.Timer monitorTimer;
+        private readonly Func<List<MonitorInfo>> readDisplayMonitors;
+        private readonly Func<MonitorInfo, uint, bool> writeBrightness;
 
         private NumericUpDown idleValue;
         private ComboBox idleUnit;
@@ -59,7 +61,10 @@ namespace ExternalMonitorDimmer
         private ToolTip toolTip;
 
         private bool monitoring;
+        // Only the current dimming cycle. Offline recovery records live on disk
+        // independently and must not make a later cycle look already dimmed.
         private bool dimmed;
+        private int disconnectedRestoreCount;
         private bool busy;
         private bool allowExit;
         private bool trayHintShown;
@@ -86,16 +91,28 @@ namespace ExternalMonitorDimmer
         private DateTime nextStatusUpdateUtc = DateTime.MinValue;
         private bool screenSaverStateKnown;
         private bool lastScreenSaverRunning;
-        private bool sessionNotificationsRegistered;
+        private IntPtr sessionNotificationWindow;
         private bool immediateSleepSyncLock;
         private bool immediateSleepSessionLocked;
         private bool immediateSleepSyncMute;
         private AudioVolumeState immediateSleepAudioState;
         private bool immediateSleepLockRequested;
+        private DateTime immediateSleepLockRequestedUtc = DateTime.MinValue;
+        private DateTime nextSessionStateCheckUtc = DateTime.MinValue;
+        private bool displayRefreshPending;
+        private DateTime displayRefreshDueUtc = DateTime.MinValue;
 
         public MainForm(bool startHidden)
+            : this(startHidden, NativeMethods.GetDisplayMonitors, NativeMethods.SetBrightness)
+        {
+        }
+
+        internal MainForm(bool startHidden, Func<List<MonitorInfo>> readDisplayMonitors,
+            Func<MonitorInfo, uint, bool> writeBrightness)
         {
             this.startHidden = startHidden;
+            this.readDisplayMonitors = readDisplayMonitors;
+            this.writeBrightness = writeBrightness;
             settings = SettingsStore.LoadSettings();
             settings.AutoStart = StartupManager.IsEnabled();
 
@@ -125,6 +142,20 @@ namespace ExternalMonitorDimmer
             FormClosing += FormClosingHandler;
             FormClosed += FormClosedHandler;
             Resize += FormResizeHandler;
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            // ShowInTaskbar (including tray hide/show) recreates the HWND. WTS
+            // subscriptions belong to that HWND, not to the Form instance.
+            RegisterSessionNotifications();
+        }
+
+        protected override void OnHandleDestroyed(EventArgs e)
+        {
+            UnregisterSessionNotifications();
+            base.OnHandleDestroyed(e);
         }
 
         public void ShowFromTray()
@@ -188,7 +219,7 @@ namespace ExternalMonitorDimmer
             subtitle.AutoSize = true;
             subtitle.Location = new Point(26, 52);
             subtitle.ForeColor = TextSecondary;
-            subtitle.Text = "DDC/CI 显示器";
+            subtitle.Text = "DDC/CI 外接屏 · Windows 内屏";
             panel.Controls.Add(subtitle);
 
             statusLabel = new Label();
@@ -413,10 +444,12 @@ namespace ExternalMonitorDimmer
             monitorList.GridLines = true;
             monitorList.HeaderStyle = ColumnHeaderStyle.Nonclickable;
             monitorList.HideSelection = false;
+            monitorList.ShowItemToolTips = true;
             monitorList.BackColor = Surface;
             monitorList.BorderStyle = BorderStyle.FixedSingle;
             monitorList.Columns.Add("显示输出", 128);
             monitorList.Columns.Add("显示器", 280);
+            monitorList.Columns.Add("亮度接口", 110);
             monitorList.Columns.Add("当前亮度", 110);
             monitorList.Columns.Add("范围", 100);
             monitorList.Resize += delegate { ResizeMonitorColumns(); };
@@ -756,6 +789,8 @@ namespace ExternalMonitorDimmer
             immediateSleepSessionLocked = false;
             immediateSleepSyncMute = false;
             immediateSleepLockRequested = false;
+            immediateSleepLockRequestedUtc = DateTime.MinValue;
+            nextSessionStateCheckUtc = DateTime.MinValue;
             immediateSleepTriggeredByMouse = false;
             immediateSleepTriggerModifiers = 0;
             immediateSleepTriggerKey = 0;
@@ -772,16 +807,17 @@ namespace ExternalMonitorDimmer
 
         private void RegisterSessionNotifications()
         {
-            if (sessionNotificationsRegistered || !IsHandleCreated)
+            if (!IsHandleCreated || sessionNotificationWindow == Handle)
             {
                 return;
             }
 
+            UnregisterSessionNotifications();
             try
             {
                 NativeMethods.RegisterSessionNotifications(Handle);
-                sessionNotificationsRegistered = true;
-                SettingsStore.Log("Session lock notifications registered.");
+                sessionNotificationWindow = Handle;
+                SettingsStore.Log("Session lock notifications registered for HWND=" + Handle + ".");
             }
             catch (Exception ex)
             {
@@ -791,14 +827,15 @@ namespace ExternalMonitorDimmer
 
         private void UnregisterSessionNotifications()
         {
-            if (!sessionNotificationsRegistered || !IsHandleCreated)
+            if (sessionNotificationWindow == IntPtr.Zero)
             {
                 return;
             }
 
-            NativeMethods.UnregisterSessionNotifications(Handle);
-            sessionNotificationsRegistered = false;
-            SettingsStore.Log("Session lock notifications unregistered.");
+            NativeMethods.UnregisterSessionNotifications(sessionNotificationWindow);
+            SettingsStore.Log("Session lock notifications unregistered for HWND=" +
+                sessionNotificationWindow + ".");
+            sessionNotificationWindow = IntPtr.Zero;
         }
 
         private bool TryMuteWorkstationAudio(bool enabled)
@@ -1052,16 +1089,15 @@ namespace ExternalMonitorDimmer
                 if (syncLock)
                 {
                     RegisterSessionNotifications();
-                    if (!sessionNotificationsRegistered)
+                    if (sessionNotificationWindow != Handle)
                     {
                         throw new InvalidOperationException("无法监控 Windows 锁屏状态，未进入屏幕保护程序。");
                     }
                 }
 
-                if (!dimmed && !File.Exists(AppPaths.BrightnessStateFile) &&
-                    !DimMonitors())
+                if (!EnsureMonitorsDimmed())
                 {
-                    throw new InvalidOperationException("外接显示器亮度调节失败，未进入屏幕保护程序。");
+                    throw new InvalidOperationException("显示器亮度调节失败，未进入屏幕保护程序。");
                 }
 
                 immediateSleepInputTick = NativeMethods.GetLastInputTickCount();
@@ -1070,6 +1106,8 @@ namespace ExternalMonitorDimmer
                 immediateSleepSessionLocked = false;
                 immediateSleepSyncMute = syncMute;
                 immediateSleepLockRequested = false;
+                immediateSleepLockRequestedUtc = DateTime.MinValue;
+                nextSessionStateCheckUtc = DateTime.MinValue;
                 immediateSleepActive = true;
                 if (syncLock)
                 {
@@ -1085,6 +1123,8 @@ namespace ExternalMonitorDimmer
                 immediateSleepSessionLocked = false;
                 immediateSleepSyncMute = false;
                 immediateSleepLockRequested = false;
+                immediateSleepLockRequestedUtc = DateTime.MinValue;
+                nextSessionStateCheckUtc = DateTime.MinValue;
                 DisposeImmediateScreenSaverProcess();
                 RestoreSavedBrightness();
                 SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
@@ -1141,6 +1181,8 @@ namespace ExternalMonitorDimmer
             {
                 DisposeImmediateScreenSaverProcess();
                 immediateSleepLockRequested = true;
+                immediateSleepLockRequestedUtc = DateTime.UtcNow;
+                nextSessionStateCheckUtc = DateTime.MinValue;
                 immediateSleepSessionLocked = false;
                 SetStatus(
                     brightnessRestored
@@ -1208,6 +1250,70 @@ namespace ExternalMonitorDimmer
             }
         }
 
+        private void HandleImmediateSessionLock()
+        {
+            if (!immediateSleepActive || !immediateSleepSyncLock ||
+                !immediateSleepLockRequested || immediateSleepSessionLocked)
+            {
+                return;
+            }
+
+            immediateSleepSessionLocked = true;
+            bool muted = TryMuteWorkstationAudio(immediateSleepSyncMute);
+            SetStatus(muted ? "已锁屏，登录屏幕中" : "已锁屏，静音失败",
+                muted ? Warning : Error);
+            SettingsStore.Log(!immediateSleepSyncMute
+                ? "Windows workstation locked after immediate screen saver exit."
+                : (muted ? "Windows workstation locked; default audio endpoint muted."
+                    : "Windows workstation locked; default audio endpoint mute failed."));
+        }
+
+        private void HandleImmediateSessionUnlock()
+        {
+            if (!immediateSleepActive || !immediateSleepSyncLock || !immediateSleepLockRequested)
+            {
+                return;
+            }
+
+            SettingsStore.Log("Windows workstation unlocked; finishing immediate screen saver session.");
+            FinishImmediateScreenSaver();
+        }
+
+        private void ReconcileImmediateSessionState(bool locked, DateTime now)
+        {
+            if (!immediateSleepActive || !immediateSleepSyncLock || !immediateSleepLockRequested)
+            {
+                return;
+            }
+
+            if (locked)
+            {
+                HandleImmediateSessionLock();
+            }
+            else if (immediateSleepSessionLocked ||
+                now >= immediateSleepLockRequestedUtc.AddSeconds(5))
+            {
+                // LockWorkStation is asynchronous. This grace period is only for
+                // recovering missed notifications; it never delays requesting a lock.
+                HandleImmediateSessionUnlock();
+            }
+        }
+
+        private void PollImmediateSessionState(DateTime now)
+        {
+            if (now < nextSessionStateCheckUtc)
+            {
+                return;
+            }
+            nextSessionStateCheckUtc = now.AddSeconds(1);
+            RegisterSessionNotifications();
+            bool locked;
+            if (NativeMethods.TryGetSessionLocked(out locked))
+            {
+                ReconcileImmediateSessionState(locked, now);
+            }
+        }
+
         private bool RestoreBrightnessAfterImmediateScreenSaverExit()
         {
             busy = true;
@@ -1233,6 +1339,8 @@ namespace ExternalMonitorDimmer
             immediateSleepSessionLocked = false;
             immediateSleepSyncMute = false;
             immediateSleepLockRequested = false;
+            immediateSleepLockRequestedUtc = DateTime.MinValue;
+            nextSessionStateCheckUtc = DateTime.MinValue;
             DisposeImmediateScreenSaverProcess();
 
             busy = true;
@@ -1245,6 +1353,7 @@ namespace ExternalMonitorDimmer
                     SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
                 }
                 nextDimAttemptUtc = DateTime.UtcNow.AddSeconds(1);
+                screenSaverStateKnown = false;
                 SettingsStore.Log("Immediate screen saver ended; brightness restore attempted.");
             }
             finally
@@ -1291,6 +1400,17 @@ namespace ExternalMonitorDimmer
             }
 
             DateTime now = DateTime.UtcNow;
+            if (displayRefreshPending && now >= displayRefreshDueUtc)
+            {
+                displayRefreshPending = false;
+                RefreshMonitorList();
+            }
+            if (immediateSleepActive && immediateSleepLockRequested)
+            {
+                // Input APIs are not a reliable wake signal on the secure desktop.
+                PollImmediateSessionState(now);
+                return;
+            }
             uint idleMilliseconds = 0;
             if (settings.TriggerMode == TriggerModeIdle)
             {
@@ -1365,6 +1485,7 @@ namespace ExternalMonitorDimmer
 
             if (!monitoring)
             {
+                RetryPendingBrightness(now);
                 return;
             }
 
@@ -1395,19 +1516,7 @@ namespace ExternalMonitorDimmer
             }
             else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
             {
-                if (now >= nextRestoreAttemptUtc)
-                {
-                    busy = true;
-                    try
-                    {
-                        RestoreSavedBrightness();
-                        nextRestoreAttemptUtc = now.AddSeconds(2);
-                    }
-                    finally
-                    {
-                        busy = false;
-                    }
-                }
+                RetryPendingBrightness(now);
             }
             else
             {
@@ -1429,6 +1538,11 @@ namespace ExternalMonitorDimmer
                 return;
             }
 
+            ProcessScreenSaverState(running, now);
+        }
+
+        private void ProcessScreenSaverState(bool running, DateTime now)
+        {
             if (now >= nextStatusUpdateUtc)
             {
                 idleStatusLabel.Text = running
@@ -1443,13 +1557,12 @@ namespace ExternalMonitorDimmer
 
             if (running)
             {
-                if (!dimmed && !File.Exists(AppPaths.BrightnessStateFile) &&
-                    now >= nextDimAttemptUtc)
+                if (!dimmed && now >= nextDimAttemptUtc)
                 {
                     busy = true;
                     try
                     {
-                        if (DimMonitors())
+                        if (EnsureMonitorsDimmed())
                         {
                             SetStatus("屏保中，已调暗", Warning);
                         }
@@ -1463,7 +1576,7 @@ namespace ExternalMonitorDimmer
                         busy = false;
                     }
                 }
-                else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
+                else if (dimmed)
                 {
                     SetStatus("屏保中，已调暗", Warning);
                 }
@@ -1474,19 +1587,7 @@ namespace ExternalMonitorDimmer
             }
             else if (dimmed || File.Exists(AppPaths.BrightnessStateFile))
             {
-                if (now >= nextRestoreAttemptUtc)
-                {
-                    busy = true;
-                    try
-                    {
-                        RestoreSavedBrightness();
-                        nextRestoreAttemptUtc = now.AddSeconds(2);
-                    }
-                    finally
-                    {
-                        busy = false;
-                    }
-                }
+                RetryPendingBrightness(now);
             }
             else
             {
@@ -1494,45 +1595,147 @@ namespace ExternalMonitorDimmer
             }
         }
 
+        private void RetryPendingBrightness(DateTime now)
+        {
+            if ((!dimmed && !File.Exists(AppPaths.BrightnessStateFile)) ||
+                now < nextRestoreAttemptUtc)
+            {
+                return;
+            }
+
+            busy = true;
+            try
+            {
+                RestoreSavedBrightness();
+            }
+            finally
+            {
+                nextRestoreAttemptUtc = DateTime.UtcNow.AddSeconds(2);
+                busy = false;
+            }
+        }
+
+        private bool EnsureMonitorsDimmed()
+        {
+            return dimmed || DimMonitors();
+        }
+
+        private static uint GetSupportedBrightness(MonitorInfo monitor, uint value)
+        {
+            return monitor.Source == BrightnessSource.WindowsWmi
+                ? WmiBrightnessProvider.SelectSupportedLevel(value, monitor.BrightnessLevels)
+                : Math.Max(monitor.Minimum, Math.Min(monitor.Maximum, value));
+        }
+
+        private uint GetDimTarget(MonitorInfo monitor)
+        {
+            double range = monitor.Maximum - monitor.Minimum;
+            return GetSupportedBrightness(monitor, (uint)Math.Round(
+                monitor.Minimum + (range * settings.DimPercent / 100.0),
+                MidpointRounding.AwayFromZero));
+        }
+
+        private bool TryWriteAndConfirmBrightness(MonitorInfo monitor, uint target)
+        {
+            if (writeBrightness(monitor, target))
+            {
+                return true;
+            }
+
+            // Some drivers apply a write but fail to acknowledge it. Only an
+            // exact device match and a fresh brightness read can confirm that.
+            try
+            {
+                MonitorInfo observed = FindCurrentMonitor(
+                    BrightnessSnapshot.FromMonitor(monitor), readDisplayMonitors());
+                if (observed != null && observed.Current == target)
+                {
+                    SettingsStore.Log(String.Format(
+                        "Brightness write confirmed by readback: {0}, source={1}, value={2}.",
+                        monitor.DeviceName, monitor.Source, target));
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                SettingsStore.Log("Brightness readback unavailable: " + ex.Message);
+            }
+            return false;
+        }
+
         private bool DimMonitors()
         {
-            List<MonitorInfo> monitors = NativeMethods.GetBrightnessMonitors();
+            List<MonitorInfo> monitors = readDisplayMonitors().FindAll(
+                delegate(MonitorInfo monitor) { return monitor.CanControlBrightness; });
             if (monitors.Count == 0)
             {
-                SetStatus("未检测到 DDC/CI 显示器", Warning);
+                SetStatus("未检测到可调光的显示器", Warning);
                 return false;
             }
 
-            BrightnessState state = new BrightnessState();
-            state.SavedAt = DateTime.Now;
+            // Merge rather than replace: an unplugged/disabled panel may still
+            // need its original brightness restored when it becomes available.
+            BrightnessState state = SettingsStore.LoadBrightnessState();
+            if (state == null)
+            {
+                state = new BrightnessState();
+                state.SavedAt = DateTime.Now;
+            }
+            bool stateChanged = false;
             foreach (MonitorInfo monitor in monitors)
             {
-                state.Monitors.Add(BrightnessSnapshot.FromMonitor(monitor));
+                if (monitor.Current == GetDimTarget(monitor))
+                {
+                    continue;
+                }
+                bool alreadySaved = state.Monitors.Exists(delegate(BrightnessSnapshot snapshot)
+                {
+                    return FindCurrentMonitor(snapshot, monitors) == monitor;
+                });
+                if (!alreadySaved)
+                {
+                    state.Monitors.Add(BrightnessSnapshot.FromMonitor(monitor));
+                    stateChanged = true;
+                }
             }
-            SettingsStore.SaveBrightnessState(state);
+            if (stateChanged)
+            {
+                // Preserve crash recovery by saving before any hardware write.
+                SettingsStore.SaveBrightnessState(state);
+            }
 
             int changedCount = 0;
             foreach (MonitorInfo monitor in monitors)
             {
-                double range = monitor.Maximum - monitor.Minimum;
-                uint target = (uint)Math.Round(
-                    monitor.Minimum + (range * settings.DimPercent / 100.0),
-                    MidpointRounding.AwayFromZero);
+                uint target = GetDimTarget(monitor);
+                uint originalBrightness = monitor.Current;
+                if (originalBrightness == target)
+                {
+                    changedCount++;
+                    continue;
+                }
 
-                if (NativeMethods.SetBrightness(monitor.DeviceName, monitor.PhysicalIndex, target))
+                if (TryWriteAndConfirmBrightness(monitor, target))
                 {
                     changedCount++;
                     SettingsStore.Log(String.Format(
-                        "Dimmed {0} from {1} to {2}.",
-                        monitor.Description,
-                        monitor.Current,
-                        target));
+                        "Dimmed {0} ({1}, {2}) from {3} to {4}.",
+                        monitor.Description, monitor.DeviceName, monitor.Source,
+                        originalBrightness, target));
+                }
+                else
+                {
+                    SettingsStore.Log(String.Format(
+                        "Brightness dim write not confirmed: {0}, source={1}, target={2}.",
+                        monitor.DeviceName, monitor.Source, target));
                 }
             }
 
             if (changedCount == 0)
             {
-                SettingsStore.DeleteBrightnessState();
+                // Never discard other devices' recovery records after a failed
+                // new attempt. Readback during restore can retire no-op writes.
+                dimmed = false;
                 SetStatus("亮度写入失败", Error);
                 return false;
             }
@@ -1544,26 +1747,36 @@ namespace ExternalMonitorDimmer
 
         private bool RestoreSavedBrightness()
         {
+            // Restoration ends this cycle, even if offline devices need a later
+            // retry. A persistent recovery file is not an active dimming flag.
+            dimmed = false;
             BrightnessState state = SettingsStore.LoadBrightnessState();
             if (state == null || state.Monitors.Count == 0)
             {
-                dimmed = false;
+                disconnectedRestoreCount = 0;
+                if (state != null)
+                {
+                    SettingsStore.DeleteBrightnessState();
+                }
+                SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
                 return true;
             }
 
             List<MonitorInfo> currentMonitors;
             try
             {
-                currentMonitors = NativeMethods.GetBrightnessMonitors();
+                currentMonitors = readDisplayMonitors();
             }
             catch (Exception ex)
             {
                 SettingsStore.Log("Could not enumerate monitors for restore: " + ex.Message);
-                dimmed = true;
+                SetStatus("显示器检测失败，稍后重试", Error);
                 return false;
             }
 
             List<BrightnessSnapshot> remaining = new List<BrightnessSnapshot>();
+            int disconnectedCount = 0;
+            int failedCount = 0;
             foreach (BrightnessSnapshot snapshot in state.Monitors)
             {
                 MonitorInfo current = FindCurrentMonitor(snapshot, currentMonitors);
@@ -1571,12 +1784,13 @@ namespace ExternalMonitorDimmer
 
                 if (current != null)
                 {
+                    uint target = GetSupportedBrightness(current, snapshot.Brightness);
+                    // A successful restore (or a failed dim that changed nothing)
+                    // must not depend on yet another write being acknowledged.
+                    restored = current.Current == target;
                     for (int attempt = 0; attempt < 3 && !restored; attempt++)
                     {
-                        restored = NativeMethods.SetBrightness(
-                            current.DeviceName,
-                            current.PhysicalIndex,
-                            snapshot.Brightness);
+                        restored = TryWriteAndConfirmBrightness(current, target);
                         if (!restored)
                         {
                             Thread.Sleep(150);
@@ -1587,32 +1801,51 @@ namespace ExternalMonitorDimmer
                 if (restored)
                 {
                     SettingsStore.Log(String.Format(
-                        "Restored {0} to {1}.",
-                        snapshot.Description,
+                        "Restored {0} ({1}, {2}) to {3}.",
+                        snapshot.Description, current.DeviceName, snapshot.Source,
                         snapshot.Brightness));
                 }
                 else
                 {
                     remaining.Add(snapshot);
+                    bool connected = currentMonitors.Exists(delegate(MonitorInfo monitor)
+                    {
+                        return FindSnapshotDisplay(snapshot, new List<MonitorInfo> { monitor }, false) != null;
+                    });
+                    if (connected)
+                    {
+                        failedCount++;
+                    }
+                    else
+                    {
+                        disconnectedCount++;
+                    }
                 }
             }
 
             if (remaining.Count == 0)
             {
                 SettingsStore.DeleteBrightnessState();
-                dimmed = false;
-                if (monitoring)
-                {
-                    SetStatus("监控中", Accent);
-                }
-                return true;
+            }
+            else if (remaining.Count != state.Monitors.Count)
+            {
+                state.Monitors = remaining;
+                SettingsStore.SaveBrightnessState(state);
             }
 
-            state.Monitors = remaining;
-            SettingsStore.SaveBrightnessState(state);
-            dimmed = true;
-            SetStatus("等待显示器重新连接", Warning);
-            return false;
+            if (disconnectedRestoreCount != disconnectedCount)
+            {
+                SettingsStore.Log("Deferred brightness recovery for inactive displays: " + disconnectedCount + ".");
+            }
+            disconnectedRestoreCount = disconnectedCount;
+            if (failedCount != 0)
+            {
+                SetStatus("部分显示器亮度恢复失败，稍后重试", Error);
+                return false;
+            }
+
+            SetStatus(monitoring ? "监控中" : "未启动", monitoring ? Accent : Inactive);
+            return true;
         }
 
         private void RecoverSavedBrightness()
@@ -1626,14 +1859,48 @@ namespace ExternalMonitorDimmer
             RestoreSavedBrightness();
         }
 
-        private MonitorInfo FindCurrentMonitor(
+        internal static MonitorInfo FindCurrentMonitor(
             BrightnessSnapshot saved,
             List<MonitorInfo> currentMonitors)
         {
+            return FindSnapshotDisplay(saved, currentMonitors, true);
+        }
+
+        private static MonitorInfo FindSnapshotDisplay(BrightnessSnapshot saved,
+            List<MonitorInfo> currentMonitors, bool requireBrightnessInterface)
+        {
+            if (requireBrightnessInterface)
+            {
+                currentMonitors = currentMonitors.FindAll(delegate(MonitorInfo monitor)
+                {
+                    return monitor.CanControlBrightness && monitor.Source == saved.Source;
+                });
+            }
+
+            if (saved.Source == BrightnessSource.WindowsWmi)
+            {
+                return FindUnique(currentMonitors, delegate(MonitorInfo monitor)
+                {
+                    return MonitorIdentity.Same(monitor.BrightnessInstanceName,
+                        saved.BrightnessInstanceName) ||
+                        MonitorIdentity.Same(monitor.PnpInstanceId, saved.PnpInstanceId);
+                });
+            }
+
+            if (!String.IsNullOrEmpty(saved.PnpInstanceId))
+            {
+                return FindUnique(currentMonitors, delegate(MonitorInfo monitor)
+                {
+                    return MonitorIdentity.Same(monitor.PnpInstanceId, saved.PnpInstanceId) &&
+                        monitor.PhysicalIndex == saved.PhysicalIndex;
+                });
+            }
+
+            // v1.6 and earlier snapshots have no source/PnP field and default to
+            // DDC/CI. Retain their original registry identity matching.
             MonitorInfo match = FindUnique(currentMonitors, delegate(MonitorInfo monitor)
             {
-                return !String.IsNullOrEmpty(saved.DeviceKey) &&
-                    monitor.DeviceKey == saved.DeviceKey &&
+                return MonitorIdentity.Same(monitor.DeviceKey, saved.DeviceKey) &&
                     monitor.PhysicalIndex == saved.PhysicalIndex;
             });
             if (match != null)
@@ -1643,13 +1910,19 @@ namespace ExternalMonitorDimmer
 
             match = FindUnique(currentMonitors, delegate(MonitorInfo monitor)
             {
-                return !String.IsNullOrEmpty(saved.DeviceId) &&
-                    monitor.DeviceId == saved.DeviceId &&
+                return MonitorIdentity.Same(monitor.DeviceId, saved.DeviceId) &&
                     monitor.PhysicalIndex == saved.PhysicalIndex;
             });
             if (match != null)
             {
                 return match;
+            }
+
+            if (!String.IsNullOrEmpty(saved.DeviceKey) || !String.IsNullOrEmpty(saved.DeviceId))
+            {
+                // A disconnected monitor's DISPLAY number can be reassigned to a
+                // different screen. Never use that number to override a known ID.
+                return null;
             }
 
             match = FindUnique(currentMonitors, delegate(MonitorInfo monitor)
@@ -1669,7 +1942,7 @@ namespace ExternalMonitorDimmer
             });
         }
 
-        private MonitorInfo FindUnique(
+        private static MonitorInfo FindUnique(
             List<MonitorInfo> monitors,
             Predicate<MonitorInfo> predicate)
         {
@@ -1694,7 +1967,8 @@ namespace ExternalMonitorDimmer
         {
             try
             {
-                List<MonitorInfo> monitors = NativeMethods.GetBrightnessMonitors();
+                List<MonitorInfo> monitors = readDisplayMonitors();
+                int controllableCount = 0;
                 monitorList.BeginUpdate();
                 monitorList.Items.Clear();
 
@@ -1707,17 +1981,28 @@ namespace ExternalMonitorDimmer
 
                     ListViewItem row = new ListViewItem(monitor.DeviceName);
                     row.SubItems.Add(String.IsNullOrWhiteSpace(monitor.Description)
-                        ? "外接显示器"
+                        ? "显示器"
                         : monitor.Description);
-                    row.SubItems.Add(String.Format("{0:0}%", percent));
-                    row.SubItems.Add(String.Format("{0}-{1}", monitor.Minimum, monitor.Maximum));
+                    row.SubItems.Add(monitor.Source == BrightnessSource.DdcCi ? "DDC/CI" :
+                        (monitor.Source == BrightnessSource.WindowsWmi ? "Windows WMI" : "不可调光"));
+                    row.SubItems.Add(monitor.CanControlBrightness ? String.Format("{0:0}%", percent) : "—");
+                    row.SubItems.Add(monitor.CanControlBrightness
+                        ? String.Format("{0}-{1}", monitor.Minimum, monitor.Maximum) : "—");
+                    row.ToolTipText = monitor.CanControlBrightness ? monitor.PnpInstanceId :
+                        "已检测到屏幕，但驱动未提供可用的亮度接口。外接屏可检查 DDC/CI 设置。" +
+                        (String.IsNullOrEmpty(WmiBrightnessProvider.LastDetectionError) ? String.Empty :
+                            " Windows 亮度接口检测失败：" + WmiBrightnessProvider.LastDetectionError);
+                    if (monitor.CanControlBrightness)
+                    {
+                        controllableCount++;
+                    }
                     monitorList.Items.Add(row);
                 }
 
                 monitorList.EndUpdate();
                 monitorCountLabel.Text = monitors.Count == 0
-                    ? "未检测到支持 DDC/CI 的显示器"
-                    : String.Format("{0} 台可控制", monitors.Count);
+                    ? "未检测到已启用的显示器"
+                    : String.Format("{0} 台 / {1} 台可调光", monitors.Count, controllableCount);
                 ResizeMonitorColumns();
             }
             catch (Exception ex)
@@ -1954,6 +2239,9 @@ namespace ExternalMonitorDimmer
         {
             statusLabel.Text = text;
             statusLabel.ForeColor = color;
+            toolTip.SetToolTip(statusLabel, disconnectedRestoreCount == 0 ? text :
+                text + String.Format("\n{0} 台未启用或未连接的显示器保留了亮度恢复记录；不影响当前屏幕，重新连接后会重试恢复。",
+                    disconnectedRestoreCount));
             statusDot.Tag = color;
             statusDot.Invalidate();
 
@@ -2052,37 +2340,22 @@ namespace ExternalMonitorDimmer
 
         protected override void WndProc(ref Message message)
         {
+            if (message.Msg == NativeMethods.WmDisplayChange)
+            {
+                displayRefreshPending = true;
+                displayRefreshDueUtc = DateTime.UtcNow.AddMilliseconds(750);
+                nextRestoreAttemptUtc = displayRefreshDueUtc;
+            }
             if (message.Msg == NativeMethods.WmWtsSessionChange)
             {
                 int sessionState = message.WParam.ToInt32();
                 if (sessionState == NativeMethods.WtsSessionLock)
                 {
-                    if (immediateSleepActive && immediateSleepSyncLock &&
-                        immediateSleepLockRequested)
-                    {
-                        bool muted = TryMuteWorkstationAudio(immediateSleepSyncMute);
-                        immediateSleepSessionLocked = true;
-                        SetStatus(
-                            muted ? "已锁屏，登录屏幕中" : "已锁屏，静音失败",
-                            muted ? Warning : Error);
-                        SettingsStore.Log(muted
-                            ? "Windows workstation locked after immediate screen saver exit; default audio endpoint muted."
-                            : "Windows workstation locked after immediate screen saver exit; default audio endpoint mute failed.");
-                        return;
-                    }
+                    HandleImmediateSessionLock();
                 }
-
-                if (sessionState == NativeMethods.WtsSessionUnlock)
+                else if (sessionState == NativeMethods.WtsSessionUnlock)
                 {
-                    if (immediateSleepActive && immediateSleepSyncLock &&
-                        immediateSleepLockRequested)
-                    {
-                        SettingsStore.Log(immediateSleepSessionLocked
-                            ? "Windows workstation unlocked; restoring brightness."
-                            : "Windows workstation unlock received before lock notification; restoring brightness.");
-                        FinishImmediateScreenSaver();
-                        return;
-                    }
+                    HandleImmediateSessionUnlock();
                 }
             }
 
@@ -2121,16 +2394,24 @@ namespace ExternalMonitorDimmer
 
         private void ResizeMonitorColumns()
         {
-            if (monitorList.Columns.Count != 4 || monitorList.ClientSize.Width <= 0)
+            if (monitorList.Columns.Count != 5 || monitorList.ClientSize.Width <= 0)
             {
                 return;
             }
 
             int available = monitorList.ClientSize.Width - 8;
-            monitorList.Columns[0].Width = 128;
-            monitorList.Columns[2].Width = 104;
-            monitorList.Columns[3].Width = 92;
-            monitorList.Columns[1].Width = Math.Max(160, available - 324);
+            float scale;
+            using (Graphics graphics = monitorList.CreateGraphics())
+            {
+                scale = graphics.DpiX / 96F;
+            }
+            monitorList.Columns[0].Width = (int)(128 * scale);
+            monitorList.Columns[2].Width = (int)(110 * scale);
+            monitorList.Columns[3].Width = (int)(90 * scale);
+            monitorList.Columns[4].Width = (int)(72 * scale);
+            int fixedWidth = monitorList.Columns[0].Width + monitorList.Columns[2].Width +
+                monitorList.Columns[3].Width + monitorList.Columns[4].Width;
+            monitorList.Columns[1].Width = Math.Max((int)(160 * scale), available - fixedWidth);
         }
 
         private Icon CreateApplicationIcon()

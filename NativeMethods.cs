@@ -5,6 +5,13 @@ using System.Runtime.InteropServices;
 
 namespace ExternalMonitorDimmer
 {
+    public enum BrightnessSource
+    {
+        DdcCi = 0,
+        WindowsWmi = 1,
+        Unsupported = 2
+    }
+
     [Serializable]
     public sealed class MonitorInfo
     {
@@ -16,6 +23,15 @@ namespace ExternalMonitorDimmer
         public uint Minimum { get; set; }
         public uint Current { get; set; }
         public uint Maximum { get; set; }
+        public BrightnessSource Source { get; set; }
+        public string PnpInstanceId { get; set; }
+        public string BrightnessInstanceName { get; set; }
+        public byte[] BrightnessLevels { get; set; }
+
+        public bool CanControlBrightness
+        {
+            get { return Source != BrightnessSource.Unsupported; }
+        }
     }
 
     internal sealed class AudioVolumeState
@@ -95,6 +111,7 @@ namespace ExternalMonitorDimmer
     {
         public const int WmHotKey = 0x0312;
         public const int WmWtsSessionChange = 0x02B1;
+        public const int WmDisplayChange = 0x007E;
         public const int WtsSessionLock = 0x0007;
         public const int WtsSessionUnlock = 0x0008;
         public const int HotKeyModifierAlt = 0x0001;
@@ -109,6 +126,8 @@ namespace ExternalMonitorDimmer
         private const uint SpifUpdateIniFile = 0x0001;
         private const uint SpifSendChange = 0x0002;
         private const uint NotifyForThisSession = 0;
+        private const int WtsCurrentSession = -1;
+        private const int WtsSessionInfoEx = 25;
         private const int AudioRenderDataFlow = 0;
         private const int AudioMultimediaRole = 1;
         private const uint ClsctxAll = 23;
@@ -120,6 +139,38 @@ namespace ExternalMonitorDimmer
         {
             public uint Size;
             public uint Time;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WtsInfoExLevel1
+        {
+            public uint SessionId;
+            public int SessionState;
+            public int SessionFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 33)]
+            public string WinStationName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 21)]
+            public string UserName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 18)]
+            public string DomainName;
+            public long LogonTime;
+            public long ConnectTime;
+            public long DisconnectTime;
+            public long LastInputTime;
+            public long CurrentTime;
+            public uint IncomingBytes;
+            public uint OutgoingBytes;
+            public uint IncomingFrames;
+            public uint OutgoingFrames;
+            public uint IncomingCompressedBytes;
+            public uint OutgoingCompressedBytes;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WtsInfoEx
+        {
+            public uint Level;
+            public WtsInfoExLevel1 Data;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -210,6 +261,15 @@ namespace ExternalMonitorDimmer
         [DllImport("wtsapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool WTSUnRegisterSessionNotification(IntPtr window);
+
+        [DllImport("wtsapi32.dll", EntryPoint = "WTSQuerySessionInformationW", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool WTSQuerySessionInformation(
+            IntPtr server, int sessionId, int informationClass,
+            out IntPtr buffer, out uint bytesReturned);
+
+        [DllImport("wtsapi32.dll")]
+        private static extern void WTSFreeMemory(IntPtr buffer);
 
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -380,6 +440,40 @@ namespace ExternalMonitorDimmer
             WTSUnRegisterSessionNotification(window);
         }
 
+        public static bool TryGetSessionLocked(out bool locked)
+        {
+            locked = false;
+            IntPtr buffer;
+            uint size;
+            if (!WTSQuerySessionInformation(IntPtr.Zero, WtsCurrentSession,
+                WtsSessionInfoEx, out buffer, out size))
+            {
+                return false;
+            }
+
+            try
+            {
+                if (buffer == IntPtr.Zero || size < Marshal.SizeOf(typeof(WtsInfoEx)))
+                {
+                    return false;
+                }
+                WtsInfoEx info = (WtsInfoEx)Marshal.PtrToStructure(buffer, typeof(WtsInfoEx));
+                // Windows 10/11: 0 = locked, 1 = unlocked. Disconnected/unknown
+                // sessions must not be mistaken for a successful unlock.
+                if (info.Level != 1 || info.Data.SessionState != 0 ||
+                    (info.Data.SessionFlags != 0 && info.Data.SessionFlags != 1))
+                {
+                    return false;
+                }
+                locked = info.Data.SessionFlags == 0;
+                return true;
+            }
+            finally
+            {
+                WTSFreeMemory(buffer);
+            }
+        }
+
         public static AudioVolumeState MuteDefaultAudioEndpoint()
         {
             IMMDeviceEnumerator enumerator = null;
@@ -490,6 +584,14 @@ namespace ExternalMonitorDimmer
 
         public static List<MonitorInfo> GetBrightnessMonitors()
         {
+            return GetDisplayMonitors().FindAll(delegate(MonitorInfo monitor)
+            {
+                return monitor.CanControlBrightness;
+            });
+        }
+
+        public static List<MonitorInfo> GetDisplayMonitors()
+        {
             List<MonitorInfo> result = new List<MonitorInfo>();
 
             MonitorEnumProc callback = delegate(
@@ -507,26 +609,20 @@ namespace ExternalMonitorDimmer
                     deviceName = logicalMonitor.Device ?? String.Empty;
                 }
 
-                DisplayDevice displayDevice = new DisplayDevice();
-                displayDevice.Size = Marshal.SizeOf(typeof(DisplayDevice));
-                string deviceId = String.Empty;
-                string deviceKey = String.Empty;
-
-                if (EnumDisplayDevices(deviceName, 0, ref displayDevice, 0))
-                {
-                    deviceId = displayDevice.DeviceId ?? String.Empty;
-                    deviceKey = displayDevice.DeviceKey ?? String.Empty;
-                }
-
+                // Enumerate desktop outputs independently of brightness support.
+                // A panel without DDC/CI must still appear in the monitor list.
+                List<MonitorInfo> endpoints = GetDisplayEndpoints(deviceName);
                 uint count;
                 if (!GetNumberOfPhysicalMonitorsFromHMONITOR(monitor, out count) || count == 0)
                 {
+                    result.AddRange(endpoints);
                     return true;
                 }
 
                 PhysicalMonitor[] physicalMonitors = new PhysicalMonitor[count];
                 if (!GetPhysicalMonitorsFromHMONITOR(monitor, count, physicalMonitors))
                 {
+                    result.AddRange(endpoints);
                     return true;
                 }
 
@@ -534,6 +630,16 @@ namespace ExternalMonitorDimmer
                 {
                     for (int index = 0; index < physicalMonitors.Length; index++)
                     {
+                        if (index >= endpoints.Count)
+                        {
+                            endpoints.Add(new MonitorInfo
+                            {
+                                DeviceName = deviceName,
+                                Description = physicalMonitors[index].Description,
+                                PhysicalIndex = index,
+                                Source = BrightnessSource.Unsupported
+                            });
+                        }
                         uint minimum;
                         uint current;
                         uint maximum;
@@ -547,16 +653,13 @@ namespace ExternalMonitorDimmer
                             continue;
                         }
 
-                        MonitorInfo info = new MonitorInfo();
-                        info.DeviceName = deviceName;
-                        info.DeviceId = deviceId;
-                        info.DeviceKey = deviceKey;
+                        MonitorInfo info = endpoints[index];
                         info.Description = physicalMonitors[index].Description ?? String.Empty;
                         info.PhysicalIndex = index;
+                        info.Source = BrightnessSource.DdcCi;
                         info.Minimum = minimum;
                         info.Current = current;
                         info.Maximum = maximum;
-                        result.Add(info);
                     }
                 }
                 finally
@@ -564,6 +667,7 @@ namespace ExternalMonitorDimmer
                     DestroyPhysicalMonitors(count, physicalMonitors);
                 }
 
+                result.AddRange(endpoints);
                 return true;
             };
 
@@ -573,7 +677,65 @@ namespace ExternalMonitorDimmer
             }
 
             GC.KeepAlive(callback);
+            WmiBrightnessProvider.MergeMonitors(result, WmiBrightnessProvider.GetActivePanels());
             return result;
+        }
+
+        private static List<MonitorInfo> GetDisplayEndpoints(string deviceName)
+        {
+            List<MonitorInfo> endpoints = new List<MonitorInfo>();
+            for (uint index = 0; ; index++)
+            {
+                DisplayDevice device = new DisplayDevice();
+                device.Size = Marshal.SizeOf(typeof(DisplayDevice));
+                if (!EnumDisplayDevices(deviceName, index, ref device, 0))
+                {
+                    break;
+                }
+                if ((device.StateFlags & 1) == 0)
+                {
+                    continue;
+                }
+
+                DisplayDevice deviceInterface = new DisplayDevice();
+                deviceInterface.Size = Marshal.SizeOf(typeof(DisplayDevice));
+                string pnpId = EnumDisplayDevices(deviceName, index, ref deviceInterface, 1)
+                    ? MonitorIdentity.NormalizePnpId(deviceInterface.DeviceId) : String.Empty;
+                endpoints.Add(new MonitorInfo
+                {
+                    DeviceName = deviceName,
+                    DeviceId = device.DeviceId,
+                    DeviceKey = device.DeviceKey,
+                    PnpInstanceId = pnpId,
+                    Description = device.DeviceString,
+                    PhysicalIndex = endpoints.Count,
+                    Source = BrightnessSource.Unsupported
+                });
+            }
+
+            if (endpoints.Count == 0)
+            {
+                endpoints.Add(new MonitorInfo
+                {
+                    DeviceName = deviceName,
+                    Description = "显示器",
+                    Source = BrightnessSource.Unsupported
+                });
+            }
+            return endpoints;
+        }
+
+        public static bool SetBrightness(MonitorInfo monitor, uint brightness)
+        {
+            if (monitor == null || !monitor.CanControlBrightness)
+            {
+                return false;
+            }
+            if (monitor.Source == BrightnessSource.WindowsWmi)
+            {
+                return WmiBrightnessProvider.SetBrightness(monitor, brightness);
+            }
+            return SetBrightness(monitor.DeviceName, monitor.PhysicalIndex, brightness);
         }
 
         public static bool SetBrightness(string deviceName, int physicalIndex, uint brightness)

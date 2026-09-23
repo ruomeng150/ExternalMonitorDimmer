@@ -51,6 +51,9 @@ namespace ExternalMonitorDimmer
         public string Description { get; set; }
         public int PhysicalIndex { get; set; }
         public uint Brightness { get; set; }
+        public BrightnessSource Source { get; set; }
+        public string PnpInstanceId { get; set; }
+        public string BrightnessInstanceName { get; set; }
 
         public static BrightnessSnapshot FromMonitor(MonitorInfo monitor)
         {
@@ -61,6 +64,9 @@ namespace ExternalMonitorDimmer
             snapshot.Description = monitor.Description;
             snapshot.PhysicalIndex = monitor.PhysicalIndex;
             snapshot.Brightness = monitor.Current;
+            snapshot.Source = monitor.Source;
+            snapshot.PnpInstanceId = monitor.PnpInstanceId;
+            snapshot.BrightnessInstanceName = monitor.BrightnessInstanceName;
             return snapshot;
         }
     }

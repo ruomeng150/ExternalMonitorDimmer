@@ -17,7 +17,7 @@ namespace ExternalMonitorDimmer
             string diagnosticsPath = GetArgumentValue(args, "--diagnostics");
             if (!String.IsNullOrEmpty(diagnosticsPath))
             {
-                RunDiagnostics(diagnosticsPath);
+                RunDiagnostics(diagnosticsPath, HasArgument(args, "--test-brightness-write"));
                 return;
             }
 
@@ -138,11 +138,15 @@ namespace ExternalMonitorDimmer
             }
         }
 
-        private static void RunDiagnostics(string outputPath)
+        private static void RunDiagnostics(string outputPath, bool testBrightnessWrite)
         {
             StringBuilder report = new StringBuilder();
             report.AppendLine("External Monitor Dimmer diagnostics");
+            report.AppendLine("Version=" + Application.ProductVersion);
             report.AppendLine("IdleMilliseconds=" + NativeMethods.GetIdleMilliseconds());
+            bool locked;
+            report.AppendLine("SessionLocked=" + (NativeMethods.TryGetSessionLocked(out locked)
+                ? locked.ToString() : "Unknown"));
             try
             {
                 report.AppendLine("ScreenSaverRunning=" + NativeMethods.IsScreenSaverRunning());
@@ -154,23 +158,32 @@ namespace ExternalMonitorDimmer
 
             try
             {
-                System.Collections.Generic.List<MonitorInfo> monitors = NativeMethods.GetBrightnessMonitors();
-                report.AppendLine("MonitorCount=" + monitors.Count);
+                System.Collections.Generic.List<MonitorInfo> monitors = NativeMethods.GetDisplayMonitors();
+                report.AppendLine("DisplayCount=" + monitors.Count);
+                report.AppendLine("MonitorCount=" + monitors.FindAll(delegate(MonitorInfo monitor)
+                {
+                    return monitor.CanControlBrightness;
+                }).Count);
+                if (!String.IsNullOrEmpty(WmiBrightnessProvider.LastDetectionError))
+                {
+                    report.AppendLine("WmiBrightnessDetectionError=" + WmiBrightnessProvider.LastDetectionError);
+                }
 
                 foreach (MonitorInfo monitor in monitors)
                 {
-                    bool sameValueWrite = NativeMethods.SetBrightness(
-                        monitor.DeviceName,
-                        monitor.PhysicalIndex,
-                        monitor.Current);
+                    string sameValueWrite = testBrightnessWrite && monitor.CanControlBrightness
+                        ? NativeMethods.SetBrightness(monitor, monitor.Current).ToString() : "Skipped";
                     report.AppendLine(String.Format(
-                        "Display={0};Monitor={1};Brightness={2};Range={3}-{4};SameValueWrite={5}",
+                        "Display={0};Monitor={1};Brightness={2};Range={3}-{4};SameValueWrite={5};Source={6};PnP={7};WmiInstance={8}",
                         monitor.DeviceName,
                         monitor.Description,
-                        monitor.Current,
-                        monitor.Minimum,
-                        monitor.Maximum,
-                        sameValueWrite));
+                        monitor.CanControlBrightness ? monitor.Current.ToString() : "Unavailable",
+                        monitor.CanControlBrightness ? monitor.Minimum.ToString() : "n/a",
+                        monitor.CanControlBrightness ? monitor.Maximum.ToString() : "n/a",
+                        sameValueWrite,
+                        monitor.Source,
+                        monitor.PnpInstanceId,
+                        monitor.BrightnessInstanceName));
                 }
             }
             catch (Exception ex)
